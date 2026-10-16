@@ -3839,6 +3839,31 @@ mod text_family_tests {
         classify_text(text, &nonblank)
     }
 
+    /// #1504: `journalctl -o short-iso` output and vsftpd `xferlog` transfer
+    /// records are line-oriented logs. Both used to fall through to
+    /// `TxtProse`: the field report's syslog and transfer files were shredded
+    /// into prose chunks with no timestamp/host/program fields to filter on.
+    /// Asserted through the full classifier — `classify_text` claims the
+    /// `Logs` family before `txt_kind` is consulted.
+    #[test]
+    fn iso_syslog_and_xferlog_files_classify_as_logs() {
+        let iso = "2026-10-16T09:06:58+0200 pbx systemd[1]: Started vsftpd service\n\
+                   2026-10-16T09:06:59+0200 pbx vsftpd[1234]: CONNECT: Client \"10.0.0.7\"\n\
+                   2026-10-16T09:07:01+0200 pbx sshd[1235]: Accepted publickey for admin\n";
+        assert_eq!(classify_full(iso), Family::Logs);
+
+        let xfer = "Fri Oct 16 09:06:58 2026 1 10.0.0.7 4242 /uploads/fw.bin b _ o r admin ftp 0 * c\n\
+                    Fri Oct 16 09:07:10 2026 2 10.0.0.7 10 /uploads/invalid.bin b _ o r admin ftp 0 * i\n\
+                    Sat Oct 17 11:00:00 2026 0 10.0.0.9 0 /pub/README b _ i a guest ftp 0 * c\n";
+        assert_eq!(classify_full(xfer), Family::Logs);
+
+        // The RFC3164 control keeps classifying (no regression).
+        let rfc = "Oct 16 09:06:58 pbx vsftpd[1234]: CONNECT: Client \"10.0.0.7\"\n\
+                   Oct 16 09:07:01 pbx sshd[1235]: Accepted publickey for admin\n\
+                   Oct 16 09:07:02 pbx pbx-phone[990]: SIP engine not registered\n";
+        assert_eq!(classify_full(rfc), Family::Logs);
+    }
+
     /// Regression: a markdown document with `## Headings` averages ~50 chars
     /// over 7 lines, which the length-only rule classified as TxtLines — the
     /// same corpus's 5-line runbook (avg 59) went to TxtProse. Same content
