@@ -54,8 +54,10 @@ fn templates() -> &'static Templates {
         // host, bytes, path, transfer type (a|b), special action flag
         // (_|C|U|T), direction (o|i), access mode (a|r), user, service,
         // auth method (0|1), authenticated user id (*|name), status (c|i).
+        // The path is lazy, not `\S+`: vsftpd writes the filename verbatim,
+        // spaces included, and the nine fixed fields after it anchor the end.
         xferlog: Regex::new(
-            r"^([A-Z][a-z]{2} [A-Z][a-z]{2} +\d+ \d{2}:\d{2}:\d{2} \d{4}) (\d+) (\S+) (\d+) (\S+) ([ab]) ([_CUT*]) ([oi]) ([ar]) (\S+) (\S+) ([01]) (\S+) ([ci])\s*$",
+            r"^([A-Z][a-z]{2} [A-Z][a-z]{2} +\d+ \d{2}:\d{2}:\d{2} \d{4}) (\d+) (\S+) (\d+) (\S.*?) ([ab]) ([_CUT*]) ([oi]) ([ar]) (\S+) (\S+) ([01]) (\S+) ([ci])\s*$",
         )
         .unwrap(),
         kv: Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_.]*)=("(?:[^"\\]|\\.)*"|\S+)"#).unwrap(),
@@ -514,6 +516,47 @@ mod tests {
         assert_eq!(m["access"], serde_json::json!("anonymous"));
         assert_eq!(m["auth_method"], serde_json::json!("rfc931"));
         assert_eq!(m["auth_user"], serde_json::json!("guest"));
+    }
+
+    /// vsftpd writes the transferred filename verbatim, spaces included, so
+    /// the path is not one whitespace-delimited token. A `\S+` path made such
+    /// a line miss the template, and under an elected `Xferlog` it was glued
+    /// onto the previous transfer as a `message`: the transfer vanished as a
+    /// record of its own.
+    #[test]
+    fn xferlog_path_with_spaces_is_its_own_record() {
+        let spaced =
+            "Fri Oct 16 09:07:12 2026 3 10.0.0.7 2048 /uploads/phone config v2.xml b _ i r admin ftp 0 * c";
+        assert_eq!(parse_kind(spaced), Some(Kind::Xferlog));
+        let m = parse_line(spaced, Kind::Xferlog).unwrap();
+        assert_eq!(m["path"], serde_json::json!("/uploads/phone config v2.xml"));
+        assert_eq!(m["bytes"], serde_json::json!(2048));
+        assert_eq!(m["direction"], serde_json::json!("incoming"));
+        assert_eq!(m["user"], serde_json::json!("admin"));
+        assert_eq!(m["status"], serde_json::json!("complete"));
+
+        // Through the real extractor: three transfers, three records.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("xferlog");
+        std::fs::write(
+            &p,
+            "Fri Oct 16 09:06:58 2026 1 10.0.0.7 4242 /uploads/fw.bin b _ o r admin ftp 0 * c\n\
+             Fri Oct 16 09:07:12 2026 3 10.0.0.7 2048 /uploads/phone config v2.xml b _ i r admin ftp 0 * c\n\
+             Sat Oct 17 11:00:00 2026 0 10.0.0.9 0 /pub/README b _ i a guest ftp 0 * c\n",
+        )
+        .unwrap();
+        let mut recs = Vec::new();
+        extract(&p, false, None, &mut |r| {
+            recs.push(r);
+            true
+        })
+        .unwrap();
+        assert_eq!(recs.len(), 3, "every transfer is a record");
+        assert!(recs.iter().all(|r| r.fields.get("message").is_none()));
+        assert_eq!(
+            recs[1].fields["path"],
+            serde_json::json!("/uploads/phone config v2.xml")
+        );
     }
 
     /// The detection side must not claim ISO-stamped prose: without the
