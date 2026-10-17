@@ -3849,7 +3849,8 @@ mod text_family_tests {
     fn iso_syslog_and_xferlog_files_classify_as_logs() {
         let iso = "2026-10-16T09:06:58+0200 pbx systemd[1]: Started vsftpd service\n\
                    2026-10-16T09:06:59+0200 pbx vsftpd[1234]: CONNECT: Client \"10.0.0.7\"\n\
-                   2026-10-16T09:07:01+0200 pbx sshd[1235]: Accepted publickey for admin\n";
+                   2026-10-16T09:07:01+0200 pbx sshd[1235]: Accepted publickey for admin\n\
+                   2026-10-16T09:07:02+0200 pbx (ogon-ops)[2357880]: Unable to locate executable\n";
         assert_eq!(classify_full(iso), Family::Logs);
 
         let xfer = "Fri Oct 16 09:06:58 2026 1 10.0.0.7 4242 /uploads/fw.bin b _ o r admin ftp 0 * c\n\
@@ -3862,6 +3863,57 @@ mod text_family_tests {
                    Oct 16 09:07:01 pbx sshd[1235]: Accepted publickey for admin\n\
                    Oct 16 09:07:02 pbx pbx-phone[990]: SIP engine not registered\n";
         assert_eq!(classify_full(rfc), Family::Logs);
+    }
+
+    /// #1504 review: the ISO-syslog template must not steal files from Csv or
+    /// TxtProse. Each shape below matched a looser draft of the template
+    /// (`\s+` separators, any `word:` tag) and changed family; they are CSV
+    /// or prose, never logs. The chosen rule is stated in the `isosyslog`
+    /// template comment: single spaces, a tag starting with a letter or `(`,
+    /// and either a numeric `[pid]` bracket or a bare `kernel`/`sudo`/`su`/
+    /// `audit`/`(unit)` tag.
+    #[test]
+    fn iso_stamped_non_syslog_files_do_not_classify_as_logs() {
+        let tsv = "2026-10-16T09:06:58Z\tGET\thttps://example.com/a\t200\n\
+                   2026-10-16T09:06:59Z\tPOST\thttps://example.com/b\t201\n\
+                   2026-10-16T09:07:00Z\tGET\thttps://example.com/c\t404\n";
+        assert_ne!(classify_full(tsv), Family::Logs, "TSV is Csv, not Logs");
+
+        let zap = "2026-10-16T09:06:58.123+0200\tINFO\tapp/main.go:42\tstarted\n\
+                   2026-10-16T09:06:59.456+0200\tWARN\tapp/db.go:17\tslow query\n\
+                   2026-10-16T09:07:00.789+0200\tERROR\tapp/api.go:88\tpanic\n";
+        assert_ne!(
+            classify_full(zap),
+            Family::Logs,
+            "zap dev log is Csv, not Logs"
+        );
+
+        let elb = "2015-05-13T23:39:43.945958Z my-lb 192.168.131.39:2817 10.0.0.1:80 0.000022 0.086224 0.000021 200 200 0 57 \"GET http://www.example.com:80/ HTTP/1.1\" \"curl/7.38.0\" - -\n\
+                   2015-05-13T23:39:44.945958Z my-lb 192.168.131.39:2817 10.0.0.1:80 0.000022 0.086224 0.000021 200 200 0 57 \"GET http://www.example.com:80/ HTTP/1.1\" \"curl/7.38.0\" - -\n\
+                   2015-05-13T23:39:45.945958Z my-lb 192.168.131.39:2817 10.0.0.1:80 0.000022 0.086224 0.000021 200 200 0 57 \"GET http://www.example.com:80/ HTTP/1.1\" \"curl/7.38.0\" - -\n";
+        assert_ne!(
+            classify_full(elb),
+            Family::Logs,
+            "ELB access log is prose, not Logs"
+        );
+
+        let git = "2026-10-16T09:06:58+02:00 a1b2c3d feat: add x\n\
+             2026-10-16T09:06:59+02:00 b2c3d4e fix: correct y\n\
+             2026-10-16T09:07:00+02:00 c3d4e5f docs: describe z\n";
+        assert_ne!(
+            classify_full(git),
+            Family::Logs,
+            "git log is prose, not Logs"
+        );
+
+        let notes = "2026-10-16T09:06:58 retro notes: we shipped rc.96\n\
+                     2026-10-16T09:07:00 retro notes: the bench held\n\
+                     2026-10-16T09:07:05 retro notes: next is review\n";
+        assert_ne!(
+            classify_full(notes),
+            Family::Logs,
+            "timestamped notes are prose, not Logs"
+        );
     }
 
     /// Regression: a markdown document with `## Headings` averages ~50 chars
