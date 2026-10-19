@@ -425,6 +425,12 @@ health check fails, start `current_exe() --insecure --port <free port ≥ 9300> 
 detached, PID to `~/.xerj/hub/node.pid`, wait for green (max 60 s), remember the port
 in `~/.xerj/hub/node.port`. Never start a node on a port that answers. `xerj hub status`
 shows it; `xerj hub stop` stops only that PID.
+A node the user started themselves needs no config for `xerj hub pull` to restore
+into it: by default a server allows snapshot **restores** (never creates) from the
+pack cache of the user it runs as (`limits.hub_pack_restore`, `xerj_common::hub::hub_packs_dir`,
+refused if that directory is a symlink or owned by another user). A server that does
+not share the cache (other user, container, other machine) refuses, and the pull
+error prints the exact `snapshot_repo_allowlist` line to add.
 
 **Tests** (`xerj-hub/tests/routing.rs`, `xerj-hub/tests/ask_flow.rs`):
 
@@ -719,6 +725,15 @@ production `hub.xerj.org`):
   `xerj_hub_ask` in one call (step 9).
 - A tampered pack (one flipped byte) and a tampered catalogue are refused, with nothing
   extracted.
+
+Runnable as `tools/hub-packs/whole_hub_e2e.sh` (`.github/workflows/hub-e2e.yml`,
+`workflow_dispatch`: a release tag or `build`, and the hub URL). It covers every
+item above except the `curl …/api/v1/def/…` check (no public node) and the
+shell-less persona (the agent harness). Per-corpus results are backfill-report rows
+(`kind: "e2e"`); the gate-level checks go to `GATE.md` and the job summary. Until a
+signed catalogue is deployed, `--rehearse <pack tags>` runs the same checks against a
+loopback catalogue of published packs re-signed with a throwaway key; their real
+signatures are checked separately, and every check says which key it ran against.
 
 Only after 12.1–12.4 pass do the held agent-surface PRs merge and the release notes
 mention Hub v2. Step 10's measurement is separate and still governs any published

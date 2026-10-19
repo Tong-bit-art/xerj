@@ -74,6 +74,36 @@ const PREPARED_RECORDS_IDENTITY: &str = "prepared-records-v1";
 const DOCUMENT_IDS_IDENTITY: &str = "document-ids-v1";
 const DETECTOR_DISABLED_IDENTITY: &str = "disabled";
 
+/// Ingest throughput for the summary line and the run document.
+///
+/// The numerator is documents this run submitted, not the live catalog
+/// count. A no-op resume of tokio left 11246 documents live and submitted
+/// 0, and `live / wall` printed 66096.3 docs/sec for a run that sent
+/// nothing. `wall == 0` (a sub-millisecond no-op) stays 0 rather than `inf`.
+pub(crate) fn ingest_docs_per_sec(submitted_this_run: u64, wall_secs: f64) -> f64 {
+    if wall_secs > 0.0 && submitted_this_run > 0 {
+        submitted_this_run as f64 / wall_secs
+    } else {
+        0.0
+    }
+}
+
+/// The indexed-vs-submitted line (#195).
+///
+/// A no-op resume prints `submitted 0 source records from 0 files` next to
+/// a large live count, which reads as "nothing is indexed". When the corpus
+/// is already live and this run sent nothing, say so. A first run
+/// (`submitted > 0`) and an empty corpus (`live == 0`) keep the bare line.
+pub(crate) fn indexed_vs_submitted_line(live: u64, submitted: u64, files: u64) -> String {
+    let mut line = format!(
+        "indexed: {live} documents live; this run submitted {submitted} source records from {files} files"
+    );
+    if live > 0 && submitted == 0 && files == 0 {
+        line.push_str(" (already indexed; nothing new to send)");
+    }
+    line
+}
+
 /// Render the `next:` guidance printed after a successful index run.
 ///
 /// The run's own credential and URL are carried into the printed commands.
@@ -106,7 +136,7 @@ pub fn next_hint(
     let Some(key) = api_key else {
         return format!(
             "\nnext: `xerj autoindex map --url {url}` for the data map; \
-             search via `curl '{url}/{prefix}-*/_search'`"
+             search via `xerj search --url {url} --prefix {prefix} \"<what you need>\"`"
         );
     };
     // A shell *expression* in every arm, so all renderings quote identically.
@@ -120,27 +150,47 @@ pub fn next_hint(
     };
     format!(
         "\nnext: `xerj autoindex map --url {url} --api-key \"{key_expr}\"` for the data map;\n\
-         \x20     search via `curl -H \"Authorization: ApiKey {key_expr}\" \
-         '{url}/{prefix}-*/_search'`"
+         \x20     search via `xerj search --url {url} --prefix {prefix} --api-key \"{key_expr}\" \
+         \"<what you need>\"`"
     )
 }
 
 /// The code-aware search hint that follows `next_hint` whenever source code
 /// was indexed. One copy, shared by BOTH success printers — the interactive
 /// run summary and the generated-run (`--no-graph`/brain) summary — because
-/// #1103 was exactly this text existing in one printer and not the other:
-/// a `--no-graph` run taught the user nothing while a graph run taught the
-/// `_passage` projection. The blind-usability rationale is in the comment
-/// at the interactive call site.
+/// #1103 was exactly this text existing in one printer and not the other.
+/// It names `xerj search` and `xerj def`: those commands already request
+/// `_passage`. A raw `_search` curl is what a blind run copied, and that
+/// path returns a whole file unless the caller knows the projection.
 pub(crate) fn code_search_hint(prefix: &str) -> String {
     format!(
-        "      code was indexed — for a function/class instead of a whole file:\n\
-         \x20       curl -s $URL/{prefix}-*/_search -H 'Content-Type: application/json' \\\n\
-         \x20         -d '{{\"query\":{{\"bool\":{{\"should\":[{{\"multi_match\":{{\"query\":\"<symbol or phrase>\",\
-         \"fields\":[\"body\",\"defs\"],\"type\":\"most_fields\"}}}},{{\"match_phrase\":{{\"defs\":{{\"query\":\"<symbol or phrase>\",\"boost\":4}}}}}}]}}}},\
-         \"_source\":[\"ax_path\",\"title\"],\"fields\":[\"_passage\"]}}'\n\
-         \x20       (the `match_phrase` clause ranks the file that DEFINES a symbol above files that merely call it; `_passage` returns \
-         the enclosing block, not the file)",
+        "      code was indexed — `xerj search` and `xerj def` ask for the matching\n\
+         \x20       passage, so the header is a path and a line when the index has one:\n\
+         \x20       xerj search --prefix {prefix} \"<what you need>\"\n\
+         \x20       xerj def --prefix {prefix} <symbol>\n\
+         \x20       (add the same --url and --api-key the map line above used)"
+    )
+}
+
+/// What to print when a run indexed both code and prose.
+///
+/// The previous text pasted a `match` on `body` only. Line files (a
+/// changelog is `txt-lines`) are stored in `text`, so that fragment misses
+/// them and teaches a query that cannot see half the corpus. Name the
+/// `ax_format` values this run actually wrote, and say which field holds
+/// which side.
+pub(crate) fn mixed_corpus_hint(formats: &[&str]) -> String {
+    let listed = if formats.is_empty() {
+        "none recorded".to_string()
+    } else {
+        formats.join(", ")
+    };
+    format!(
+        "      this corpus mixes code and prose — code volume can swamp prose on\n\
+         \x20     shared words. Scope one side with a filter on `ax_format`\n\
+         \x20     (values in this run: {listed}).\n\
+         \x20     Prose sections are stored in `body`; line files such as changelogs\n\
+         \x20     are stored in `text`, so a match on `body` alone misses them."
     )
 }
 
@@ -3660,6 +3710,9 @@ fn build_phase_a(
         }
     }
     let mut clusters = dataset::cluster(sketches, &rels, &scopes);
+    // `{prefix}-{slug}` must not stutter (`logs-logs-syslog`) when the slug's
+    // first segment is the prefix the operator already chose.
+    dataset::drop_repeated_prefix(&cfg.prefix, &mut clusters);
 
     // Demoted one-off config files (#173) were sampled as flattened records;
     // phase B will index them as documents. Re-sample them through the same
@@ -4982,13 +5035,17 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
         println!("{summary}");
     } else if !cfg.quiet {
         println!(
-            "generation {} committed — {} datasets, {} records live",
+            "generation {} committed — {}, {} live",
             generation,
-            dataset_count,
-            summary
-                .get("records_total")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
+            estimate::count_phrase(dataset_count as u64, "dataset", "datasets"),
+            estimate::count_phrase(
+                summary
+                    .get("records_total")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "record",
+                "records",
+            ),
         );
         // #929: read from the committed manifest, so a no-op re-run names the
         // refused datasets again instead of only the run that met the refusal.
@@ -5683,24 +5740,39 @@ fn truncation_note_message(rels: &[String]) -> Option<String> {
     // name only the first — so a mailbox holding one 2.3 GB message was told it
     // had "hit the per-file record cap (4096)" with 205 records, and to "raise
     // the cap", which is advice for a cap it never reached (review finding on
-    // PR #949). The flag does not say which cap fired, so the note names all
-    // three and what each one kept.
-    //
-    // "The file's tail" is right only for the first cause. A mailbox with one
-    // oversized message loses THAT message's tail; every message after it is
-    // indexed (review of PR #949: 201 of 201 messages after a 2.3 GB one were
-    // found), so the note says what was dropped per cause.
+    // PR #949). The flag does not say which cap fired. A path that looks like
+    // mail keeps all three causes. A plain document does not: telling the
+    // reader of an 8 MB `.txt` that a later mail message might still be
+    // indexed is false, and it is the note they actually saw.
+    let cause = if names.iter().any(|rel| rel_looks_like_mail(rel)) {
+        format!(
+            "one of: a single document over the per-document record cap ({} sections; its later \
+             sections were dropped), a mail message over the {} MB per-message cap (only that \
+             message's head was parsed; the messages after it are indexed), or a message with more \
+             MIME parts than the attachment cap (its later parts were dropped). Split the document \
+             or the message if the dropped part matters (#381)",
+            extract::MAX_RECORDS_PER_FILE,
+            extract::eml::MAX_EML >> 20,
+        )
+    } else {
+        format!(
+            "the per-document record cap is {} sections; later sections were dropped. Split the \
+             document if the dropped part matters (#381)",
+            extract::MAX_RECORDS_PER_FILE,
+        )
+    };
     Some(format!(
-        "{} file(s) had content cut short that was NOT indexed: {listed}{tail} — one of: a \
-         single document over the per-document record cap ({} sections; its later sections \
-         were dropped), a mail message over the {} MB per-message cap (only that message's \
-         head was parsed; the messages after it are indexed), or a message with more MIME \
-         parts than the attachment cap (its later parts were dropped). Split the document or \
-         the message if the dropped part matters (#381)",
+        "{} file(s) had content cut short that was NOT indexed: {listed}{tail} — {cause}",
         names.len(),
-        extract::MAX_RECORDS_PER_FILE,
-        extract::eml::MAX_EML >> 20,
     ))
+}
+
+/// The mail caps only apply to a mailbox. The last path component is enough:
+/// `inbox.eml`, `lists.mbox`, `note.msg`.
+fn rel_looks_like_mail(rel: &str) -> bool {
+    let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".eml") || lower.ends_with(".mbox") || lower.ends_with(".msg")
 }
 
 fn note_truncated_files(pr: &Progress, rels: &[String]) {
@@ -5729,15 +5801,35 @@ mod truncation_note_tests {
         );
         assert!(msg.contains("4096") && msg.contains("#381"), "{msg}");
         assert!(!msg.contains("and 0 more"), "{msg}");
-        // Every cap that can set the flag is named — an oversized mail message
-        // is not a "record cap" and must not be reported as one.
+        assert!(msg.contains("later sections were dropped"), "{msg}");
+        assert!(!msg.contains("raise the cap"), "{msg}");
+        // Neither file is mail. The mail caps must not be offered as a reason
+        // the tail might still be indexed.
+        assert!(!msg.contains("per-message cap"), "{msg}");
+        assert!(!msg.contains("MIME parts"), "{msg}");
+        assert!(!msg.contains("the messages after it are indexed"), "{msg}");
+    }
+
+    #[test]
+    fn a_mailbox_keeps_the_three_causes() {
+        let msg = truncation_note_message(&["mail/inbox.mbox".into(), "big.txt".into()]).unwrap();
+        assert!(
+            msg.contains("mail/inbox.mbox") && msg.contains("big.txt"),
+            "{msg}"
+        );
+        // The flag does not say which file hit which cap, so a list that
+        // contains any mailbox still names all three.
         assert!(msg.contains("64 MB per-message cap"), "{msg}");
         assert!(msg.contains("MIME parts"), "{msg}");
-        assert!(!msg.contains("raise the cap"), "{msg}");
-        // An oversized message costs that message's tail, not the mailbox's:
-        // the note must not tell a mailbox owner the rest of the file is gone.
+        assert!(msg.contains("4096"), "{msg}");
         assert!(!msg.contains("their tail"), "{msg}");
         assert!(msg.contains("the messages after it are indexed"), "{msg}");
+        assert!(truncation_note_message(&["Notes.EML".into()])
+            .unwrap()
+            .contains("MIME parts"));
+        assert!(!truncation_note_message(&["notes.eml.txt".into()])
+            .unwrap()
+            .contains("MIME parts"));
     }
 
     #[test]
@@ -5973,21 +6065,9 @@ fn run_index_report_inner(
     // #1102: ping's raw context is honest but teaches a first-time user
     // nothing — autoindex is the onboarding verb, so the no-node case here
     // gets the same recipe `xerj def` already prints: start one, or aim at
-    // an existing node.
+    // an existing node. `xerj autoindex map` uses the same wording.
     if let Err(e) = es.ping() {
-        if esclient::Es::ping_failure_is_auth(&e) {
-            anyhow::bail!(
-                "the node at {url} answered, but authentication failed.\n{e:#}",
-                url = cfg.url
-            );
-        }
-        anyhow::bail!(
-            "no XERJ node reachable at {url} ({e:#})\n\n\
-             Start one, then re-run this command:\n  \
-             xerj --insecure --data-dir ./.xerj-data &\n\n\
-             (or point at an existing node with --url / $XERJ_URL)",
-            url = cfg.url
-        );
+        anyhow::bail!("{}", node_ping_failure(&cfg.url, &e));
     }
 
     // `--label <question-set>` (#1062): every record's payload goes through
@@ -6909,10 +6989,9 @@ fn run_index_report_inner(
             &cfg,
         );
         pdf_spools = spools;
-        pr.note(&format!(
-            "phase A: {} datasets inferred, {} junk/skipped files",
-            plan.datasets.len(),
-            plan.junk_files.len()
+        pr.note(&estimate::phase_a_line(
+            plan.datasets.len() as u64,
+            plan.junk_files.len() as u64,
         ));
         clusters_rt = Some(clusters);
         plan
@@ -7030,21 +7109,21 @@ fn run_index_report_inner(
     pr.note(&format!("estimate: basis — {}", run_estimate.basis));
     for family in &run_estimate.families {
         pr.note(&format!(
-            "  estimate: {:<10} {:>5} files {:>9} at {}/s measured over {} file(s) / {} → {}",
+            "  estimate: {:<10} {} {:>9} at {}/s measured over {} / {} → {}",
             family.family,
-            family.planned_files,
+            estimate::count_files_column(family.planned_files),
             estimate::human_bytes(family.planned_bytes),
             estimate::human_bytes(family.bytes_per_sec as u64),
-            family.measured_files,
+            estimate::count_phrase(family.measured_files, "file", "files"),
             estimate::human_bytes(family.measured_bytes),
             estimate::human_secs(family.seconds_of_work),
         ));
     }
     for family in &run_estimate.unmeasured_families {
         pr.note(&format!(
-            "  estimate: {:<10} {:>5} files {:>9} NOT priced — {}",
+            "  estimate: {:<10} {} {:>9} NOT priced — {}",
             family.family,
-            family.planned_files,
+            estimate::count_files_column(family.planned_files),
             estimate::human_bytes(family.planned_bytes),
             family.reason,
         ));
@@ -7052,26 +7131,7 @@ fn run_index_report_inner(
     for exclude in &run_estimate.excludes {
         pr.note(&format!("  estimate excludes: {exclude}"));
     }
-    pr.note(&format!(
-        "work order: {} — {} inside each band at {} worker(s); a file that outlasts everything \
-         above it starts first regardless of band",
-        bands
-            .iter()
-            .map(|band| format!(
-                "{} ({} files, {})",
-                band.band,
-                band.files,
-                estimate::human_bytes(band.bytes)
-            ))
-            .collect::<Vec<_>>()
-            .join(" → "),
-        if cfg.workers == 1 {
-            "smallest first"
-        } else {
-            "biggest first"
-        },
-        cfg.workers,
-    ));
+    pr.note(&order::work_order_line(&bands, cfg.workers));
     for band in &bands {
         pr.note(&format!("  {:<16} {}", band.band, band.why));
     }
@@ -9122,14 +9182,12 @@ fn run_index_report_inner(
     let total_records: u64 = ds_counts.values().sum();
     // #904: ingest throughput, so the cost of a slow embedder (#366) is
     // visible in the summary itself rather than something an operator has
-    // to derive by hand from the elapsed line. `wall` can be 0.0 on a
-    // sub-millisecond run (e.g. an all-resume no-op); reporting 0 docs/sec
-    // there is more honest than a divide-by-zero `inf`.
-    let docs_per_sec = if wall > 0.0 {
-        total_records as f64 / wall
-    } else {
-        0.0
-    };
+    // to derive by hand from the elapsed line. The numerator is what THIS
+    // run submitted. Dividing the live catalog count by `wall` makes a
+    // no-op resume claim tens of thousands of docs/sec. `wall` can be 0.0
+    // on a sub-millisecond run; reporting 0 docs/sec there is more honest
+    // than a divide-by-zero `inf`.
+    let docs_per_sec = ingest_docs_per_sec(records_total.load(Ordering::Relaxed), wall);
     // Run-summary honesty (§6.6.4): what the detectors wrote AND what they
     // could not resolve — a dangling [[link]] is a fact about the corpus, not
     // something to swallow.
@@ -9359,8 +9417,18 @@ fn run_index_report_inner(
     if cfg.json {
         println!("{run_doc}");
     } else if !cfg.quiet {
-        println!("\ndone in {wall:.1}s — {} datasets, {} records live, {} duplicate aliases, {} junk records, {} junk/skipped files ({docs_per_sec:.1} docs/sec)",
-            plan.datasets.len(), total_records, plan.duplicate_files.len(), junk_total_records, junk_file_count);
+        println!(
+            "\n{}",
+            estimate::done_summary_line(
+                wall,
+                plan.datasets.len() as u64,
+                total_records,
+                plan.duplicate_files.len() as u64,
+                junk_total_records,
+                junk_file_count as u64,
+                docs_per_sec,
+            )
+        );
         // Indexed-vs-submitted honesty line (#195): the live count against
         // what this run actually submitted, so a silent-rejection mismatch
         // is visible in the client output alone. Units differ on purpose: a
@@ -9368,10 +9436,12 @@ fn run_index_report_inner(
         // documents, but submitted records with ZERO live documents is
         // always a defect (and fails above, before this line prints).
         println!(
-            "indexed: {} documents live; this run submitted {} source records from {} files",
-            total_records,
-            records_total.load(Ordering::Relaxed),
-            files_done.load(Ordering::Relaxed),
+            "{}",
+            indexed_vs_submitted_line(
+                total_records,
+                records_total.load(Ordering::Relaxed),
+                files_done.load(Ordering::Relaxed),
+            )
         );
         if !unextracted_archives.is_empty() {
             println!("not indexed — archives are never opened; extract, then run this command on the extracted folder:");
@@ -9415,14 +9485,10 @@ fn run_index_report_inner(
                 cfg.api_key_file.as_deref(),
             )
         );
-        // This line is where an agent learns how to search, so it is where the
-        // code-aware form belongs. A blind usability run showed the cost of
-        // omitting it: the agent followed exactly this guidance, got whole
-        // files back, and reinvented client-side slicing rather than
-        // discovering `_passage` — which it never saw mentioned anywhere.
-        // Only printed when source code was actually indexed; for a PDF or log
-        // corpus it would be noise. The text itself is shared with the
-        // generated-run printer via `code_search_hint` (#1103).
+        // This line is where an agent learns how to search. Only printed when
+        // source code was actually indexed; for a PDF or log corpus it would
+        // be noise. The text itself is shared with the generated-run printer
+        // via `code_search_hint` (#1103).
         let indexed_code = plan.files.values().any(|fa| fa.family == "code");
         if indexed_code {
             println!("{}", code_search_hint(&cfg.prefix));
@@ -9439,20 +9505,10 @@ fn run_index_report_inner(
             .values()
             .any(|fa| fa.family.starts_with("txt") || fa.family == "html");
         if indexed_code && indexed_prose {
-            println!(
-                "      this corpus mixes code and prose — code volume can swamp prose on\n\
-                 \x20     shared words. Scope the side you want:\n\
-                 \x20       …,\"query\":{{\"bool\":{{\"must\":[{{\"match\":{{\"body\":\"<text>\"}}}}],\
-                 \"filter\":[{{\"term\":{{\"ax_format\":\"code\"}}}}]}}}}\n\
-                 \x20       (values for `ax_format` in this run: {})",
-                {
-                    let mut fams: Vec<&str> =
-                        plan.files.values().map(|fa| fa.family.as_str()).collect();
-                    fams.sort_unstable();
-                    fams.dedup();
-                    fams.join(", ")
-                }
-            );
+            let mut fams: Vec<&str> = plan.files.values().map(|fa| fa.family.as_str()).collect();
+            fams.sort_unstable();
+            fams.dedup();
+            println!("{}", mixed_corpus_hint(&fams));
         }
     }
     // Exit 3 means "completed, some input was unusable". Backend rejections
@@ -9545,12 +9601,66 @@ fn format_str(sn: Option<&Sniffed>) -> String {
 
 // ─── map subcommand ──────────────────────────────────────────────────────
 
+/// What autoindex and `xerj map` say when the node does not answer.
+///
+/// A connect error is the common first-run miss (`xerj map` with nothing
+/// listening). An auth failure is the opposite — the node is up — so it must
+/// not tell the reader to start one.
+fn node_ping_failure(url: &str, err: &anyhow::Error) -> String {
+    if esclient::Es::ping_failure_is_auth(err) {
+        format!("the node at {url} answered, but authentication failed.\n{err:#}")
+    } else {
+        format!(
+            "no XERJ node reachable at {url} ({err:#})\n\n\
+             Start one, then re-run this command:\n  \
+             xerj --insecure --data-dir ./.xerj-data &\n\n\
+             (or point at an existing node with --url / $XERJ_URL)"
+        )
+    }
+}
+
+#[cfg(test)]
+mod node_ping_failure_tests {
+    use super::node_ping_failure;
+
+    #[test]
+    fn an_unreachable_node_gets_the_start_recipe() {
+        let err = anyhow::anyhow!(
+            "endpoint unreachable: http://127.0.0.1:9: Connection refused (os error 111)"
+        );
+        let msg = node_ping_failure("http://127.0.0.1:9", &err);
+        assert!(
+            msg.contains("no XERJ node reachable at http://127.0.0.1:9"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("xerj --insecure --data-dir ./.xerj-data"),
+            "{msg}"
+        );
+        assert!(msg.contains("--url"), "{msg}");
+        assert!(!msg.contains("authentication failed"), "{msg}");
+    }
+
+    #[test]
+    fn an_auth_failure_does_not_say_the_node_is_down() {
+        let err = anyhow::anyhow!("GET / failed (HTTP 401)");
+        let msg = node_ping_failure("http://127.0.0.1:9200", &err);
+        assert!(msg.contains("authentication failed"), "{msg}");
+        assert!(!msg.contains("no XERJ node reachable"), "{msg}");
+        assert!(!msg.contains("xerj --insecure"), "{msg}");
+    }
+}
+
 fn run_map(cfg: MapCfg) -> Result<i32> {
     if let Some(note) = &cfg.xerj_url_note {
         eprintln!("autoindex: {note}");
     }
     let es = Es::new(&cfg.url, cfg.api_key.clone())?;
-    es.ping()?;
+    // The same first-run miss as `xerj search`: nothing is listening, and a
+    // raw `endpoint unreachable` does not say how to start a node.
+    if let Err(e) = es.ping() {
+        anyhow::bail!("{}", node_ping_failure(&cfg.url, &e));
+    }
     let fetch = |query: Value, size: usize, sort: Option<Value>| -> Result<Vec<Value>> {
         let mut body = json!({"query": query, "size": size});
         if let Some(s) = sort {
@@ -11270,12 +11380,10 @@ mod generation_contract_identity_tests {
             "map hint must carry the key, got: {hint}"
         );
         assert!(
-            hint.contains("Authorization: ApiKey s3cret"),
-            "search hint must carry the key, got: {hint}"
-        );
-        assert!(
-            hint.contains("http://localhost:9510/ax-*/_search"),
-            "search hint must target the run's url and prefix, got: {hint}"
+            hint.contains(
+                "xerj search --url http://localhost:9510 --prefix ax --api-key \"s3cret\""
+            ),
+            "search hint must carry the url, prefix, and key, got: {hint}"
         );
         // Nothing is left as an un-runnable `GET /…` sketch.
         assert!(
@@ -11298,7 +11406,7 @@ mod generation_contract_identity_tests {
         );
         assert!(
             hint.contains("--api-key \"$XERJ_API_KEY\"")
-                && hint.contains("Authorization: ApiKey $XERJ_API_KEY"),
+                && hint.contains("xerj search --url http://localhost:9200 --prefix ax --api-key \"$XERJ_API_KEY\""),
             "must reference the exported variable, got: {hint}"
         );
 
@@ -11322,6 +11430,81 @@ mod generation_contract_identity_tests {
             "an auth-free server must get auth-free hints, got: {hint}"
         );
         assert!(hint.contains("xerj autoindex map --url http://localhost:9200"));
+        assert!(
+            hint.contains("xerj search --url http://localhost:9200 --prefix ax"),
+            "an auth-free search hint is still the CLI, got: {hint}"
+        );
+        let code = code_search_hint("smoke-anyhow");
+        assert!(
+            code.contains("xerj search --prefix smoke-anyhow")
+                && code.contains("xerj def --prefix smoke-anyhow"),
+            "{code}"
+        );
+        assert!(
+            !code.contains("curl"),
+            "the code hint must not send the reader to a raw search, got: {code}"
+        );
+    }
+
+    /// Resume of an already-indexed tokio tree printed
+    /// `submitted 0 source records from 0 files` beside 11246 live documents
+    /// and `(66096.3 docs/sec)`. The live count is the catalog; the rate is
+    /// this run's submissions.
+    #[test]
+    fn resume_that_sends_nothing_says_already_indexed_and_rates_zero() {
+        let line = indexed_vs_submitted_line(11246, 0, 0);
+        assert!(
+            line.contains("submitted 0 source records from 0 files"),
+            "{line}"
+        );
+        assert!(
+            line.contains("(already indexed; nothing new to send)"),
+            "{line}"
+        );
+        assert!(
+            !indexed_vs_submitted_line(11246, 11246, 861).contains("already indexed"),
+            "a first run that submitted records must keep the bare line"
+        );
+        assert!(
+            !indexed_vs_submitted_line(0, 0, 0).contains("already indexed"),
+            "an empty corpus is not already indexed"
+        );
+        assert_eq!(ingest_docs_per_sec(0, 0.2), 0.0);
+        assert_eq!(ingest_docs_per_sec(0, 0.0), 0.0);
+        assert_eq!(ingest_docs_per_sec(10, 2.0), 5.0);
+        // Live documents must not leak into the rate. The old formula was
+        // `11246 / 0.17 ≈ 66096`.
+        assert_eq!(ingest_docs_per_sec(0, 11246.0 / 66096.3), 0.0);
+    }
+
+    /// A tokio index stored CHANGELOG.md as `txt-lines` in `text`. The done
+    /// banner pasted a `match` on `body` only, so following it cannot see
+    /// that file. The hint names `text` and the run's `ax_format` values.
+    #[test]
+    fn mixed_corpus_hint_names_text_and_does_not_match_body_only() {
+        let hint = mixed_corpus_hint(&["code", "json", "txt-lines", "txt-prose"]);
+        assert!(
+            hint.contains("values in this run: code, json, txt-lines, txt-prose"),
+            "{hint}"
+        );
+        assert!(hint.contains("`text`"), "{hint}");
+        assert!(hint.contains("`body`"), "{hint}");
+        assert!(
+            hint.contains("ax_format"),
+            "the scope field must still be named, got: {hint}"
+        );
+        assert!(
+            !hint.contains("\"match\""),
+            "must not teach a body-only JSON filter, got: {hint}"
+        );
+        assert!(
+            !hint.contains("<text>"),
+            "must not leave a JSON placeholder, got: {hint}"
+        );
+
+        let empty = mixed_corpus_hint(&[]);
+        assert!(empty.contains("none recorded"), "{empty}");
+        assert!(!empty.contains("\"match\""), "{empty}");
     }
 
     /// A blind onboarding run found `autoindex` discovering `./data/admin.key`

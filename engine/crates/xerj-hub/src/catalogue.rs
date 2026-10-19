@@ -516,6 +516,24 @@ fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result
 
     // Only trusted bytes get parsed and cached.
     let cat = parse_catalogue(&body)?;
+
+    // Anti-rollback. A signature proves the hub made these bytes, not that they
+    // are the hub's CURRENT catalogue: every catalogue the hub ever signed
+    // verifies for ever. Whoever answers for the hub URL (a compromised mirror or
+    // CDN, a captive proxy, an `XERJ_HUB_URL` someone else chose) could otherwise
+    // replay an older signed catalogue, and `hub sync` would then "update" every
+    // cached pack back to an older pin and delete the newer one. A catalogue
+    // generated before the copy already cached is refused and the cache kept.
+    if let Some(prev) = read_cached(cache_file) {
+        if is_rollback(&cat.generated_at, &prev.generated_at) {
+            bail!(
+                "refusing a catalogue generated {} — older than the cached one ({}); a signed \
+                 but older catalogue is a rollback, so the cache was kept",
+                cat.generated_at,
+                prev.generated_at
+            );
+        }
+    }
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create cache dir {}", parent.display()))?;
@@ -533,6 +551,20 @@ fn fetch_and_store(hub_url: &str, cache_file: &Path, etag_file: &Path) -> Result
         }
     }
     Ok(cat)
+}
+
+/// True when `fetched` was generated before `cached` — a rollback. Both are the
+/// signed `generated_at` (RFC 3339). An unparsable cached time cannot anchor a
+/// comparison, so it never blocks; an unparsable fetched time against a
+/// parsable cached one cannot be shown to be newer, so it is refused.
+fn is_rollback(fetched: &str, cached: &str) -> bool {
+    let Ok(cached) = chrono::DateTime::parse_from_rfc3339(cached.trim()) else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(fetched.trim()) {
+        Ok(fetched) => fetched < cached,
+        Err(_) => true,
+    }
 }
 
 /// The response's `Content-Type`, or `no content type`.
@@ -583,14 +615,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HubPubkeyEnv;
     use std::io::{Read, Write};
-    use std::sync::Mutex;
     use std::time::SystemTime;
 
     use xerj_autoindex::harvest::sign::generate_keypair;
-
-    /// `XERJ_HUB_PUBKEY` is process-global; serialise the tests that set it.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A `.key`/`.pub` keypair for the tests (hex seed, hex public key).
     fn keypair() -> (String, String) {
@@ -833,17 +862,17 @@ mod tests {
 
     #[test]
     fn load_offline_uses_fresh_cache_without_network() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let (bytes, sig, public) = fixture_bytes(fx.path());
 
         let cache = tempfile::tempdir().unwrap();
         seed_cache(cache.path(), &bytes, &sig);
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         // the hub URL is unreachable on purpose — offline must never dial it
         let cat = load_catalogue("http://127.0.0.1:1", cache.path(), true).expect("offline load");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
 
         assert_eq!(cat.corpora.len(), 2);
         assert_eq!(cat.corpora[0].slug, "alpha");
@@ -885,7 +914,7 @@ mod tests {
 
     #[test]
     fn load_rejects_tampered_network_replacement_and_keeps_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let (good_bytes, good_sig, public) = fixture_bytes(fx.path());
 
@@ -899,9 +928,9 @@ mod tests {
         tampered[good_bytes.len() / 2] ^= 0x01;
         let (url, handle) = spawn_hub(tampered, good_sig.clone());
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         let cat = load_catalogue(&url, cache.path(), false).expect("falls back to cached copy");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         // the signature guarded the replacement: the GOOD cached copy is served,
@@ -915,7 +944,7 @@ mod tests {
 
     #[test]
     fn load_accepts_verified_network_replacement_into_empty_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let (good_bytes, good_sig, public) = fixture_bytes(fx.path());
 
@@ -923,9 +952,9 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let (url, handle) = spawn_hub(good_bytes.clone(), good_sig.clone());
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         let cat = load_catalogue(&url, cache.path(), false).expect("verified fetch");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         assert_eq!(cat.corpora.len(), 2);
@@ -936,7 +965,7 @@ mod tests {
 
     #[test]
     fn refresh_ignores_a_young_cache_and_fetches_the_newer_catalogue() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let inputs = two_inputs(fx.path());
 
@@ -955,14 +984,14 @@ mod tests {
         let new_bytes = canonical_json(&new_cat).unwrap();
         let (url, handle) = spawn_hub(new_bytes.clone(), new_sig);
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &new_public);
+        env.set(&new_public);
         let trusted = load_catalogue(&url, cache.path(), false).expect("young cache is served");
         assert_eq!(
             trusted.generated_at, "2026-10-13T00:00:00Z",
             "load_catalogue trusts a young cache without asking the hub"
         );
         let refreshed = refresh_catalogue(&url, cache.path()).expect("forced refresh");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         assert_eq!(
@@ -975,7 +1004,7 @@ mod tests {
 
     #[test]
     fn refresh_reports_a_tampered_catalogue_instead_of_serving_the_cache() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let (good_bytes, good_sig, public) = fixture_bytes(fx.path());
         let cache = tempfile::tempdir().unwrap();
@@ -985,10 +1014,10 @@ mod tests {
         tampered[good_bytes.len() / 2] ^= 0x01;
         let (url, handle) = spawn_hub(tampered, good_sig.clone());
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         let err = refresh_catalogue(&url, cache.path())
             .expect_err("a refresh that cannot be verified is an error, not a stale answer");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         assert!(
@@ -1026,16 +1055,16 @@ mod tests {
 
     #[test]
     fn an_html_page_served_as_the_catalogue_reads_as_unavailable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         let fx = tempfile::tempdir().unwrap();
         let (_, _, public) = fixture_bytes(fx.path());
         let cache = tempfile::tempdir().unwrap();
         // One GET: the catalogue is refused before the signature is even asked for.
         let (url, handle) = spawn_html_site(1);
 
-        std::env::set_var("XERJ_HUB_PUBKEY", &public);
+        env.set(&public);
         let err = load_catalogue(&url, cache.path(), false).expect_err("HTML is not a catalogue");
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         handle.join().unwrap();
 
         let msg = format!("{err:#}");
@@ -1049,17 +1078,17 @@ mod tests {
 
     #[test]
     fn load_with_no_key_fetches_nothing_and_caches_nothing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         // The loader used to fail OPEN here (cache the fetched copy unverified,
         // with a warning). With no key it now refuses before dialing the hub.
-        std::env::set_var("XERJ_HUB_PUBKEY", xerj_common::hub::HUB_PUBKEY_NONE);
+        env.set(xerj_common::hub::HUB_PUBKEY_NONE);
         let hub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         hub.set_nonblocking(true).unwrap();
         let url = format!("http://{}", hub.local_addr().unwrap());
         let cache = tempfile::tempdir().unwrap();
 
         let err = load_catalogue(&url, cache.path(), false).unwrap_err();
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
 
         assert!(
             format!("{err:#}").contains("no hub public key"),
@@ -1074,11 +1103,11 @@ mod tests {
 
     #[test]
     fn the_compiled_in_key_verifies_and_refuses_a_test_signed_catalogue() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let env = HubPubkeyEnv::lock();
         // No override: the shipping key (HUB_PUBKEY_HEX) is what verifies. A
         // catalogue signed by any other key — here a throwaway test key — must be
         // refused and must not reach the cache.
-        std::env::remove_var("XERJ_HUB_PUBKEY");
+        env.remove();
         let fx = tempfile::tempdir().unwrap();
         let (good_bytes, good_sig, _public) = fixture_bytes(fx.path());
         let cache = tempfile::tempdir().unwrap();
@@ -1092,5 +1121,53 @@ mod tests {
         // as a 32-byte key in the very function the client verifies with.
         assert!(msg.contains("signature does not verify"), "{msg}");
         assert!(!cache.path().join(CACHE_FILE).exists(), "nothing cached");
+    }
+
+    #[test]
+    fn an_older_signed_catalogue_is_refused_as_a_rollback() {
+        let env = HubPubkeyEnv::lock();
+        let fx = tempfile::tempdir().unwrap();
+        let inputs = two_inputs(fx.path());
+        let (seed, public) = keypair();
+
+        // The client already holds today's catalogue (aged, so it would refresh).
+        let (new_cat, new_sig) = build_catalogue(&inputs, "2026-10-14T00:00:00Z", &seed).unwrap();
+        let new_bytes = canonical_json(&new_cat).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        seed_cache(cache.path(), &new_bytes, &new_sig);
+        age_file(&cache.path().join(CACHE_FILE), 48 * 3600);
+
+        // The hub URL answers with an OLDER catalogue, genuinely signed by the
+        // trusted key — a replay of what the hub published two weeks earlier.
+        let (old_cat, old_sig) = build_catalogue(&inputs, "2026-10-01T00:00:00Z", &seed).unwrap();
+        let old_bytes = canonical_json(&old_cat).unwrap();
+
+        env.set(&public);
+        let (url, handle) = spawn_hub(old_bytes.clone(), old_sig.clone());
+        let err = refresh_catalogue(&url, cache.path()).expect_err("a rollback is refused");
+        handle.join().unwrap();
+        let (url, handle) = spawn_hub(old_bytes, old_sig);
+        let served = load_catalogue(&url, cache.path(), false).expect("cached copy kept");
+        env.remove();
+        handle.join().unwrap();
+
+        assert!(format!("{err:#}").contains("rollback"), "{err:#}");
+        assert_eq!(served.generated_at, "2026-10-14T00:00:00Z");
+        let on_disk = fs::read(cache.path().join(CACHE_FILE)).unwrap();
+        assert_eq!(on_disk, new_bytes, "the newer cache is untouched");
+    }
+
+    #[test]
+    fn rollback_comparison_rules() {
+        assert!(is_rollback("2026-10-01T00:00:00Z", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-14T00:00:00Z", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-15T00:00:00Z", "2026-10-14T00:00:00Z"));
+        // Same instant, different offset: not older.
+        assert!(!is_rollback(
+            "2026-10-14T02:00:00+02:00",
+            "2026-10-14T00:00:00Z"
+        ));
+        assert!(is_rollback("not a time", "2026-10-14T00:00:00Z"));
+        assert!(!is_rollback("2026-10-01T00:00:00Z", "not a time"));
     }
 }

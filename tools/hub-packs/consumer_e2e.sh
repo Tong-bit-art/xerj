@@ -17,6 +17,8 @@
 #      snapshot restore — all against the key compiled into <xerj>;
 #   4. `xerj code <slug> --def <symbol> --json`, the symbol taken from the pack's
 #      own defs.jsonl, must return that symbol from the local pack;
+#      4b. the same lookup with NO XERJ_URL must find the node from the ledger
+#      `hub pull` wrote (not localhost:9200);
 #   5. `xerj code <slug> "<word from ask_for>" --json` must return a hit with a
 #      file and a line.
 #
@@ -63,17 +65,16 @@ python3 -m http.server "$HUB_PORT" --bind 127.0.0.1 --directory "$WORK/site" \
   > "$WORK/http.log" 2>&1 &
 PIDS+=("$!")
 
-# 2. A fresh node and an empty HOME. The node allows snapshot repositories only
-#    under the hub's pack cache, as the automatic node does (node.rs).
+# 2. A fresh node and an empty HOME. The node is started the way a user starts
+#    one — no config file, no snapshot allowlist: a server restores from the pack
+#    cache of the user it runs as by default (limits.hub_pack_restore), and this
+#    gate is what proves `xerj hub pull` works against such a node.
 export HOME="$WORK/home"
 # XERJ_HUB_PUBKEY is deliberately NOT unset: CI never sets it, so the key compiled
 # into <xerj> governs there; a local rehearsal with a throwaway key sets it.
 unset XERJ_CODE_HOME XERJ_HUB_HOME XERJ_API_KEY
-mkdir -p "$HOME/.xerj/hub/packs"
-printf '[limits]\nsnapshot_repo_allowlist = ["%s"]\n' "$(realpath "$HOME/.xerj/hub/packs")" \
-  > "$WORK/node/config.toml"
 "$BIN" --insecure --bind 127.0.0.1 --port "$NODE_PORT" --data-dir "$WORK/node/data" \
-  --config "$WORK/node/config.toml" > "$WORK/node/node.log" 2>&1 &
+  > "$WORK/node/node.log" 2>&1 &
 PIDS+=("$!")
 export XERJ_URL="http://127.0.0.1:$NODE_PORT"
 export XERJ_HUB_URL="http://127.0.0.1:$HUB_PORT"
@@ -107,6 +108,18 @@ jq -e --argjson d "$DEF" '
   "$WORK/def.json" >/dev/null \
   || { cat "$WORK/def.json"; fail "--def $SYM did not return $(jq -r '"\(.file):\(.line)"' <<<"$DEF") from the local pack"; }
 echo "def ok: $SYM -> $(jq -r '"\(.file):\(.line)"' <<<"$DEF") (answered_from local_pack)"
+
+# 4b. The same lookup BARE: no XERJ_URL, no --url — the command `hub pull` tells
+#     a user to run next. It must find the node the pack was restored into from
+#     the ledger, not fall back to localhost:9200 (where nothing listens here).
+env -u XERJ_URL "$BIN" code "$SLUG" --def "$SYM" --json > "$WORK/def-bare.json" \
+  || { cat "$WORK/def-bare.json"; fail "bare xerj code $SLUG --def $SYM (no XERJ_URL) failed"; }
+jq -e --argjson d "$DEF" '
+  .answered_from == "local_pack"
+  and ([.hits[]? | select(.file == $d.file and .line == $d.line)] | length) > 0' \
+  "$WORK/def-bare.json" >/dev/null \
+  || { cat "$WORK/def-bare.json"; fail "bare --def $SYM (no XERJ_URL) did not find the pulled pack's node"; }
+echo "bare def ok: $SYM with no XERJ_URL found the pulled pack's node"
 
 # 5. One question: a word from the catalogue entry's ask_for. Words the template
 #    sentence ("an agent working on ... queries this for ...") always carries say

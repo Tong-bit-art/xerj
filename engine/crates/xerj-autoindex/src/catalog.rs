@@ -697,15 +697,29 @@ pub fn render_map_page(
         } else {
             format!(", wall {wall}s")
         };
+        // `junk_records_total` is records that failed extraction. A run can
+        // list junk *files* (css, fonts, encrypted PDFs, "no records
+        // extracted") while that counter stays 0. The headline has to name
+        // the files the section below lists, and stay byte-identical when
+        // the list is empty.
+        let junk_records = g("junk_records_total");
+        let junk_clause = if junk_files.is_empty() {
+            format!("{junk_records} junk records")
+        } else {
+            format!(
+                "{junk_records} junk records, {} junk/skipped files",
+                junk_files.len()
+            )
+        };
         s.push_str(&format!(
-            "run `{}` — root `{}` — {} paths ({} unique content, {} duplicate aliases), {} records indexed, {} junk records{}\n\n",
+            "run `{}` — root `{}` — {} paths ({} unique content, {} duplicate aliases), {} records indexed, {}{}\n\n",
             g("run_id"),
             g("root"),
             g("files_total"),
             g("unique_content_files"),
             g("duplicate_files"),
             g("records_total"),
-            g("junk_records_total"),
+            junk_clause,
             wall_clause,
         ));
     }
@@ -733,9 +747,12 @@ pub fn render_map_page(
         }
         s.push('\n');
     }
-    s.push_str("## Datasets\n\n");
-    s.push_str("| index | records | files | formats | time field | time range |\n");
-    s.push_str("|---|---|---|---|---|---|\n");
+    s.push_str(&format!("## Datasets ({})\n\n", datasets.len()));
+    // `slug` is the argument to `--dataset`. The index name is
+    // `{prefix}-{slug}`, and a hyphenated prefix makes the slug impossible
+    // to recover from the index column alone.
+    s.push_str("| slug | index | records | files | formats | time field | time range |\n");
+    s.push_str("|---|---|---|---|---|---|---|\n");
     for d in datasets {
         let g = |k: &str| d.get(k).map(pretty_val).unwrap_or_default();
         let range = match (d.get("time_min"), d.get("time_max")) {
@@ -744,8 +761,14 @@ pub fn render_map_page(
             }
             _ => "—".into(),
         };
+        let slug = g("slug");
         s.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} |\n",
+            "| {} | `{}` | {} | {} | {} | {} | {} |\n",
+            if slug.is_empty() {
+                "—".into()
+            } else {
+                format!("`{slug}`")
+            },
             g("index_name"),
             g("record_count"),
             g("file_count"),
@@ -817,10 +840,7 @@ pub fn render_map_page(
                         f.null_ratio * 100.0,
                         f.examples
                             .iter()
-                            .map(|e| {
-                                let short: String = clean(e).chars().take(40).collect();
-                                format!("`{}`", short.replace('|', "\\|").replace('`', "'"))
-                            })
+                            .map(|e| map_example_cell(e))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -971,6 +991,22 @@ fn pretty_val(v: &Value) -> String {
     clean(&s)
 }
 
+/// One markdown table cell for a field example.
+///
+/// [`clean`] keeps newlines and tabs, and this cell is interpolated into a
+/// `| field | ... | examples |` row. A newline ends the row, so an example
+/// whose next line starts with `##` is rendered as a heading. Collapse
+/// whitespace onto one line, then cap the cell.
+fn map_example_cell(raw: &str) -> String {
+    let flat = clean(raw).split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short: String = flat.chars().take(40).collect();
+    if flat.chars().count() > 40 {
+        short = flat.chars().take(39).collect();
+        short.push('…');
+    }
+    format!("`{}`", short.replace('|', "\\|").replace('`', "'"))
+}
+
 /// Strip control characters (raw data can contain NULs etc. — they would
 /// make the rendered map read as a binary file).
 fn clean(s: &str) -> String {
@@ -1033,6 +1069,18 @@ mod duplicate_tests {
             "summary table lists every dataset"
         );
         assert!(rendered.contains("`ax-d19`"));
+        assert!(
+            rendered.contains("## Datasets (20)"),
+            "the heading names how many datasets the table holds: {rendered}"
+        );
+        assert!(
+            rendered.contains("| slug |"),
+            "the summary names the slug `--dataset` takes"
+        );
+        assert!(
+            rendered.contains("`d00`") && rendered.contains("`d19`"),
+            "every row carries its slug, not only its index name: {rendered}"
+        );
         assert_eq!(
             rendered.matches("### `").count(),
             super::MAP_DETAIL_PAGE,
@@ -1045,6 +1093,62 @@ mod duplicate_tests {
         assert!(page.contains("### `ax-d09`"));
         assert!(!page.contains("### `ax-d10`"));
         assert!(page.contains("Field detail for datasets 9–10 of 20"));
+    }
+
+    fn one_field(name: &str, example: &str) -> crate::infer::FieldSpec {
+        crate::infer::FieldSpec {
+            name: name.into(),
+            es_type: "text".into(),
+            date_enc: None,
+            semantic: None,
+            cardinality_est: 1,
+            cardinality_overflow: false,
+            null_ratio: 0.0,
+            avg_len: 3.0,
+            coverage: 1.0,
+            examples: vec![example.into()],
+            notes: vec![],
+            date_min: None,
+            date_max: None,
+            date_evidence: vec![],
+            num_min: None,
+            num_max: None,
+        }
+    }
+
+    /// A newline in an example used to end the markdown row. The next line
+    /// (`## Branded types…`) was then a heading in the middle of the table.
+    #[test]
+    fn an_example_newline_stays_inside_its_table_row() {
+        let dataset = json!({
+            "index_name": "ax-branded",
+            "slug": "branded",
+            "record_count": 1,
+            "file_count": 1,
+            "formats": "json",
+            "fields_json": serde_json::to_string(&vec![
+                one_field("code", "code\n## Branded types for type guard"),
+                one_field("wide", &format!("alpha\tbeta {}", "n".repeat(40))),
+            ]).unwrap()
+        });
+        let rendered = render_map(None, &[dataset], &[], &[], &[], 0);
+        assert!(
+            !rendered.lines().any(|l| l.starts_with("## Branded")),
+            "a newline in an example forged a heading:\n{rendered}"
+        );
+        let row = rendered
+            .lines()
+            .find(|l| l.contains("code ## Branded"))
+            .expect("the example stays on the field row");
+        assert!(row.starts_with('|'), "{row}");
+        assert!(!row.contains('\n'));
+        let wide = rendered
+            .lines()
+            .find(|l| l.contains("alpha beta"))
+            .expect("a tab is a space");
+        assert!(wide.starts_with('|'), "{wide}");
+        assert!(wide.contains('…'), "a long example is capped: {wide}");
+        assert!(!wide.contains(&"n".repeat(40)), "{wide}");
     }
 
     #[test]
@@ -1104,6 +1208,33 @@ mod duplicate_tests {
             rendered_legacy.contains("0 junk records, wall 1.4s\n\n"),
             "legacy wall_seconds must still render: {rendered_legacy}"
         );
+    }
+
+    /// The summary used to say "0 junk records" on a map whose later section
+    /// listed 17 skipped files. The file count belongs in the headline when
+    /// the list is non-empty, and only then.
+    #[test]
+    fn the_summary_names_junk_files_when_the_list_is_nonempty() {
+        let run = json!({
+            "doc_kind": "run",
+            "run_id": "nb",
+            "root": "/corpus",
+            "files_total": 36,
+            "unique_content_files": 36,
+            "duplicate_files": 0,
+            "records_total": 286,
+            "junk_records_total": 0
+        });
+        let junk = vec![
+            json!({"path": "style.css", "status": "skipped", "reason": "no records extracted"}),
+            json!({"path": "font.woff", "status": "skipped", "reason": "no records extracted"}),
+        ];
+        let rendered = render_map(Some(&run), &[], &[], &junk, &[], junk.len() as u64);
+        assert!(
+            rendered.contains("286 records indexed, 0 junk records, 2 junk/skipped files\n\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("## Junk / skipped (2 files recorded"));
     }
 
     #[test]

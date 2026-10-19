@@ -242,7 +242,7 @@
   <p>Both installers verify <strong>fail-closed</strong>: each computes the archive's own SHA-256 and compares it against the published digest, and if the checksum cannot be downloaded, or no SHA-256 tool (<code class="inline">sha256sum</code>, <code class="inline">shasum</code>, <code class="inline">openssl</code>, <code class="inline">busybox</code>…) can be found, the installer stops rather than installing an unverified binary.</p>
   <p>On Linux the one-liner installs the <strong>static musl</strong> build by default — it runs on any distro including Alpine and has no glibc-version floor. Ask for the glibc build explicitly if you need it:</p>
 <pre class="code">$ curl -fsSL https://xerj.org/get | XERJ_LIBC=gnu sh</pre>
-  <p>Other environment overrides: <code class="inline">XERJ_VERSION</code> (install a specific tag), <code class="inline">XERJ_INSTALL_DIR</code> (default <code class="inline">~/.local/bin</code>), <code class="inline">XERJ_REPO</code>.</p>
+  <p>Other environment overrides: <code class="inline">XERJ_VERSION</code> (install a specific tag), <code class="inline">XERJ_INSTALL_DIR</code> (default <code class="inline">~/.local/bin</code> on Linux and macOS, <code class="inline">%LOCALAPPDATA%\Programs\xerj</code> on Windows), <code class="inline">XERJ_REPO</code>.</p>
 
   <h2>Manual download</h2>
   <p>Every release publishes eight targets, each with a <code class="inline">.sha256</code> alongside: <code class="inline">x86_64</code>/<code class="inline">aarch64</code> × <code class="inline">unknown-linux-musl</code> (static, any distro), <code class="inline">unknown-linux-gnu</code>, <code class="inline">apple-darwin</code>, and <code class="inline">pc-windows-msvc</code> (.zip).</p>
@@ -291,7 +291,7 @@ data_dir     = "/var/lib/xerj"
 
 [auth]
 enabled = true</pre>
-  <p>With <code class="inline">auth.enabled = true</code>, the first start prints an auto-generated admin API key and writes it to <code class="inline">&lt;data_dir&gt;/admin.key</code> — every native-API request (including health) must send it, and so must the CLI clients that talk to this node (see <a href="#first-index">Index your first folder</a> below). For TLS, either set <code class="inline">[tls] enabled = true</code> with a PEM <code class="inline">cert_path</code> and <code class="inline">key_path</code> (in-process rustls on ports 8080/9200; see <a href="/docs/security">Auth &amp; TLS</a>), or terminate TLS at a reverse proxy (nginx/caddy) in front of those ports. The gRPC port 8081 stays plaintext h2c either way.</p>
+  <p>With <code class="inline">auth.enabled = true</code>, the first start writes an auto-generated admin API key to <code class="inline">&lt;data_dir&gt;/admin.key</code> and the banner names that file without printing the key — every native-API request (including health) must send it, and so must the CLI clients that talk to this node (see <a href="#first-index">Index your first folder</a> below). For TLS, either set <code class="inline">[tls] enabled = true</code> with a PEM <code class="inline">cert_path</code> and <code class="inline">key_path</code> (in-process rustls on ports 8080/9200; see <a href="/docs/security">Auth &amp; TLS</a>), or terminate TLS at a reverse proxy (nginx/caddy) in front of those ports. The gRPC port 8081 stays plaintext h2c either way.</p>
 
   <h2>Run as a systemd unit</h2>
   <p>Create the service user first — <code class="inline">StateDirectory</code> then gives it <code class="inline">/var/lib/xerj</code> automatically:</p>
@@ -345,7 +345,7 @@ $ docker run -d --name xerj \
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V1.0.0-RC.96 · 2026-08-11</span>
+    <span>XERJ.AI · V1.0.0-RC.97 · 2026-08-11</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>Install</span>
   </div>
@@ -403,7 +403,7 @@ $ docker run -d --name xerj \
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.96</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.97</span>
   <span>READ THE SOURCE</span>
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>
