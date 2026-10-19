@@ -37,8 +37,12 @@ fn make_engine(dir: &TempDir) -> Engine {
 
 fn books_schema() -> Schema {
     let mut schema = Schema::empty();
-    schema.fields.push(FieldConfig::new("title", FieldType::Text));
-    schema.fields.push(FieldConfig::new("kw", FieldType::Keyword));
+    schema
+        .fields
+        .push(FieldConfig::new("title", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("kw", FieldType::Keyword));
     schema
 }
 
@@ -141,12 +145,28 @@ async fn filter_and_filters_aggs_count_what_the_same_clause_counts_as_a_query() 
     )
     .await;
     assert_eq!(body["m"]["doc_count"], json!(2), "match(dog) != ES: {body}");
-    assert_eq!(body["or"]["doc_count"], json!(2), "match(quick fox) != ES: {body}");
-    assert_eq!(body["phr"]["doc_count"], json!(0), "match_phrase(fox dog) != ES: {body}");
-    assert_eq!(body["ok"]["doc_count"], json!(1), "match_phrase(fox and) != ES: {body}");
+    assert_eq!(
+        body["or"]["doc_count"],
+        json!(2),
+        "match(quick fox) != ES: {body}"
+    );
+    assert_eq!(
+        body["phr"]["doc_count"],
+        json!(0),
+        "match_phrase(fox dog) != ES: {body}"
+    );
+    assert_eq!(
+        body["ok"]["doc_count"],
+        json!(1),
+        "match_phrase(fox and) != ES: {body}"
+    );
     // Whole-value `term` on text: the query path's answer, not ES's (see the
     // module comment). The point is that the agg no longer has its own answer.
-    assert_eq!(body["t"]["doc_count"], json!(0), "term(dog) must match _count: {body}");
+    assert_eq!(
+        body["t"]["doc_count"],
+        json!(0),
+        "term(dog) must match _count: {body}"
+    );
 }
 
 /// The schema scope must survive the bucket boundary: a `filter` nested under
