@@ -3364,6 +3364,7 @@ mod phase_a_grouping_tests {
             label: None,
             debounce: std::time::Duration::from_millis(0),
             exclude_rels: Vec::new(),
+            walk_only: false,
         }
     }
 
@@ -6074,6 +6075,219 @@ mod truncation_note_tests {
     }
 }
 
+/// Per-top-level-folder totals for `--walk-only` (#1912): a 220k-file drive is
+/// easier to reason about as a handful of folders than as one number. Files at
+/// the root group under `(root)`; folders are ordered by bytes, largest first.
+fn folder_totals(files: &[walk::FileEntry]) -> Vec<(String, usize, u64)> {
+    let mut by_folder: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    for file in files {
+        let key = file
+            .rel
+            .split_once('/')
+            .map(|(top, _)| top)
+            .unwrap_or_default();
+        let slot = by_folder.entry(key).or_default();
+        slot.0 += 1;
+        slot.1 += file.size;
+    }
+    let mut rows: Vec<(String, usize, u64)> = by_folder
+        .into_iter()
+        .map(|(folder, (files, bytes))| {
+            let name = if folder.is_empty() {
+                "(root)".to_string()
+            } else {
+                folder.to_string()
+            };
+            (name, files, bytes)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+/// How many per-folder rows `--walk-only` prints before the tail is a count.
+const WALK_FOLDER_LINES: usize = 20;
+
+/// Human bytes for the per-folder map. The run's totals keep the historical
+/// integer-MB line; the map is where a reader compares folders, and "0 MB" for
+/// a folder of small files hides the one number that answers "which folder is
+/// the bulk?".
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// `--walk-only` (#1912): the walk and its "where did my files go?" map, with
+/// no hashing, no node contact and no state. `--dry-run` was the only way to
+/// map a tree, and it reads every byte (measured ~6 MB/s on a 500 GB drive);
+/// this mode answers the same question from the metadata the walk already has.
+///
+/// The map is the RESULT, so it goes to stdout — `--quiet` must not hide it and
+/// a pipe can consume it — while the progress surface still owns stderr.
+fn run_walk_only(cfg: &IndexCfg) -> Result<i32> {
+    let root_str = cfg.root.display().to_string();
+    let surface = progress::detect(cfg.progress);
+    let pr = Progress::new(
+        surface,
+        cfg.progress_interval
+            .unwrap_or_else(|| progress::default_interval(surface)),
+    );
+    let _ticker = pr.spawn_ticker();
+    pr.phase("walk", 0, 0);
+    let (files, ignore_report) = walk::walk_reporting_opts(
+        &cfg.root,
+        cfg.follow_symlinks,
+        cfg.follow_symlinks_outside_root,
+        cfg.ignore,
+    )?;
+    let (files, excluded) = without_excluded_rels(files, &cfg.exclude_rels);
+    let ignore_lines = ignore_report.summary_lines();
+    let bytes: u64 = files.iter().map(|file| file.size).sum();
+    let folders = folder_totals(&files);
+    if cfg.json {
+        let folders: Vec<Value> = folders
+            .into_iter()
+            .map(|(folder, files, bytes)| json!({"folder": folder, "files": files, "bytes": bytes}))
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "walk_only": true,
+                "root": root_str,
+                "files": files.len(),
+                "bytes": bytes,
+                "excluded": excluded,
+                "folders": folders,
+                "ignore": ignore_lines,
+            })
+        );
+    } else {
+        println!(
+            "walk-only: {} ({}) under {root_str}",
+            estimate::count_phrase(files.len() as u64, "file", "files"),
+            human_bytes(bytes)
+        );
+        if excluded > 0 {
+            println!(
+                "  left out {excluded} path(s) ({}), not part of this corpus index",
+                cfg.exclude_rels.join(", ")
+            );
+        }
+        for (folder, count, folder_bytes) in folders.iter().take(WALK_FOLDER_LINES) {
+            println!(
+                "  {folder}  {}  {}",
+                estimate::count_phrase(*count as u64, "file", "files"),
+                human_bytes(*folder_bytes)
+            );
+        }
+        if folders.len() > WALK_FOLDER_LINES {
+            println!(
+                "  ... and {} more folder(s)",
+                folders.len() - WALK_FOLDER_LINES
+            );
+        }
+        println!(
+            "  no file contents were read and no node was contacted; an index-time estimate \
+             needs the parse/plan pass (drop --walk-only to get one)"
+        );
+        for line in &ignore_lines {
+            println!("  {line}");
+        }
+    }
+    pr.finish(
+        true,
+        0,
+        "walk-only",
+        &[("files", files.len() as u64), ("bytes", bytes)],
+    );
+    Ok(0)
+}
+
+#[cfg(test)]
+mod walk_only_tests {
+    use super::*;
+
+    fn entry(rel: &str, size: u64) -> walk::FileEntry {
+        walk::FileEntry {
+            path: std::path::PathBuf::from(rel),
+            rel: rel.to_string(),
+            rel_id: rel.to_string(),
+            is_symlink: false,
+            size,
+        }
+    }
+
+    /// #1912: the map groups by the first path component and orders by bytes,
+    /// so the folder that dominates a drive is the first line. Files at the
+    /// root are their own group, not attributed to a folder they are not in.
+    #[test]
+    fn folders_are_top_level_groups_sorted_by_bytes() {
+        let files = vec![
+            entry("src/b.rs", 20),
+            entry("src/a.rs", 10),
+            entry("docs/guide.md", 5),
+            entry("README.md", 1),
+        ];
+        assert_eq!(
+            folder_totals(&files),
+            vec![
+                ("src".to_string(), 2, 30),
+                ("docs".to_string(), 1, 5),
+                ("(root)".to_string(), 1, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_tree_has_no_folder_rows() {
+        assert!(folder_totals(&[]).is_empty());
+    }
+
+    #[test]
+    fn human_bytes_keeps_small_folders_visible() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(8 * 1024 * 1024), "8.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    /// The mode's contract is "no node": point it at a port that refuses
+    /// connections and require success. A regression that reaches `Es::ping`
+    /// (the first thing a normal run does) turns this red.
+    #[test]
+    fn walk_only_succeeds_with_an_unreachable_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+        let cfg = match crate::cli::parse(vec![
+            dir.path().display().to_string(),
+            "--walk-only".into(),
+            "--url".into(),
+            "http://127.0.0.1:1".into(),
+            "--progress".into(),
+            "none".into(),
+        ])
+        .unwrap()
+        {
+            crate::cli::Cmd::Index(cfg) => *cfg,
+            other => panic!("expected an index config, got {other:?}"),
+        };
+        assert_eq!(run_index_report(cfg).unwrap().0, 0);
+    }
+}
+
 /// `run_index` plus the machine-readable run summary — the same JSON the
 /// run writes to the catalog as `run:{run_id}` (datasets, `records_total`
 /// as *live* per-dataset counts, `graph.edges_written` etc.). `xerj brain`
@@ -6082,6 +6296,9 @@ mod truncation_note_tests {
 /// `None` when the run ended before a plan produced one (empty folder,
 /// `--dry-run`).
 pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
+    if cfg.walk_only {
+        return run_walk_only(&cfg).map(|code| (code, None));
+    }
     run_index_report_tallied(cfg, &ScanTally::default())
 }
 

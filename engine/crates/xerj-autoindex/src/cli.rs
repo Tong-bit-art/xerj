@@ -105,6 +105,12 @@ pub struct IndexCfg {
     /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
     pub no_graph: bool,
     pub dry_run: bool,
+    /// `--walk-only` (#1912): stop after the walk and report per-top-level-folder
+    /// file counts and bytes. No file contents are read, no node is contacted
+    /// and nothing is written. It exists because `--dry-run` hashes every byte
+    /// — measured at ~6 MB/s on a 500 GB drive — which makes it useless as a
+    /// "what is in this tree?" map, while `autoindex map` needs a prior index.
+    pub walk_only: bool,
     /// Stop and ask before indexing when phase A's measured estimate exceeds
     /// this many minutes. `0` disables the gate outright.
     pub max_minutes: u64,
@@ -377,6 +383,8 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20subdirectory, which this flag cannot do.\n\
          \x20\x20\x20\x20--yes, -y            alias for --approve proceed\n\
          \x20\x20\x20\x20--dry-run            walk+sniff+infer, print the plan, index nothing\n\
+         \x20\x20\x20\x20--walk-only          stop after the walk: file counts and bytes per\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20top-level folder, ignore reasons, no hashing, no node\n\
          \x20\x20\x20\x20--label <FILE>       label each document at ingest through POST /_decide\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(#1062): the question-set file's noul/choice questions\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20are rendered against each record's fields and the vote\n\
@@ -811,6 +819,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut watch = false;
     let mut debounce_ms: Option<u64> = None;
     let mut dry_run = false;
+    let mut walk_only = false;
     let mut max_minutes = DEFAULT_MAX_MINUTES;
     let mut max_minutes_explicit = false;
     let mut approve: Option<Approval> = None;
@@ -1046,6 +1055,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 approve_explicit = true;
             }
             "--dry-run" => dry_run = true,
+            // #1912: the walk without the hash pass. Its own mode — the
+            // combinations that would silently ignore another flag are refused
+            // below — not a variant of the dry-run output.
+            "--walk-only" => walk_only = true,
             "--json" => json = true,
             "--md" => json = false,
             "--code-analyzer" => {
@@ -1273,6 +1286,38 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         .as_deref()
         .map(looks_like_object_url)
         .unwrap_or(false);
+
+    // `--walk-only` is a LOCAL map of a tree: it reads no bytes and contacts no
+    // node. An object source has no local tree to walk until it is fetched, a
+    // watcher needs the node this mode exists to avoid, and a label pass needs
+    // ingest. Refuse rather than accept the flag and silently not do it (#204).
+    if walk_only && root_is_object_url {
+        return Err(
+            "--walk-only maps a local folder; an object source is priced with --dry-run, \
+             which fetches the listing"
+                .into(),
+        );
+    }
+    if walk_only && watch {
+        return Err(
+            "--walk-only stops after the walk; --watch exists to index changes as they land. \
+             Drop one of the two"
+                .into(),
+        );
+    }
+    if walk_only && label.is_some() {
+        return Err(
+            "--walk-only stops before ingest, so --label has nothing to label. Drop one of the two"
+                .into(),
+        );
+    }
+    if walk_only && dry_run {
+        return Err(
+            "--walk-only stops after the walk, while --dry-run promises the sniffed plan. \
+             Drop one of the two"
+                .into(),
+        );
+    }
 
     // `--approve fast` is not a hint: it is the answer "index everything, but
     // without the two expensive features", and the run has to actually apply
@@ -1726,6 +1771,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 brain,
                 no_graph,
                 dry_run,
+                walk_only,
                 max_minutes,
                 approve,
                 json,
@@ -2112,6 +2158,24 @@ mod tests {
 
     fn err(args: &[&str]) -> String {
         parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
+    }
+
+    /// #1912: `--walk-only` is its own mode (no hashing, no node), so the
+    /// combinations that would make it silently not do what the other flag says
+    /// are refused rather than downgraded (#204's class).
+    #[test]
+    fn walk_only_parses_and_refuses_combinations_that_would_ignore_it() {
+        let cfg = index(&["data", "--walk-only"]);
+        assert!(cfg.walk_only && !cfg.dry_run && !cfg.watch);
+        assert!(
+            !index(&["data", "--dry-run"]).walk_only,
+            "a dry run is not walk-only"
+        );
+
+        assert!(err(&["data", "--walk-only", "--dry-run"]).contains("--dry-run"));
+        assert!(err(&["data", "--walk-only", "--watch"]).contains("--watch"));
+        assert!(err(&["data", "--walk-only", "--label", "q.json"]).contains("--label"));
+        assert!(err(&["s3://bucket/prefix", "--walk-only"]).contains("--walk-only"));
     }
 
     /// The `--watch` refusal must name the limitation it actually has. Measured
