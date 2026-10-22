@@ -564,6 +564,60 @@ mod collection_publication_fail_closed_tests {
         );
     }
 
+    /// `doc_values: false` fields (text, semantic_text) record presence, not
+    /// values. The bit must follow `value_present`: empty string and a
+    /// non-null array element are present; null, `[]`, and `[null]` are not.
+    /// An all-absent field still ships a column so `exists` can answer
+    /// "no" without a source scan.
+    #[test]
+    fn build_doc_value_columns_presence_matches_value_present() {
+        use xerj_storage::doc_values::Column;
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("msg".to_string());
+        skip.insert("never".to_string());
+        let docs = [
+            json!({"ax_file": "a"}),
+            json!({"ax_file": "a", "msg": null}),
+            json!({"ax_file": "a", "msg": []}),
+            json!({"ax_file": "a", "msg": ""}),
+            json!({"ax_file": "a", "msg": [null]}),
+            json!({"ax_file": "a", "msg": "hello"}),
+            json!({"ax_file": "a", "msg": [null, "x"]}),
+        ];
+        let cols = super::build_doc_value_columns(docs.iter().map(Some), &skip);
+        let Some(Column::Presence(msg)) = cols.get("msg") else {
+            panic!("msg must be a presence column, got {:?}", cols.get("msg"));
+        };
+        assert_eq!(msg.doc_count, 7);
+        assert!(!msg.contains(0) && !msg.contains(1) && !msg.contains(2) && !msg.contains(4));
+        assert!(msg.contains(3) && msg.contains(5) && msg.contains(6));
+        assert_eq!(msg.count(), 3);
+        let Some(Column::Presence(never)) = cols.get("never") else {
+            panic!("an all-absent skipped field must still ship a presence column");
+        };
+        assert_eq!(never.doc_count, 7);
+        assert_eq!(never.count(), 0);
+        assert!(matches!(cols.get("ax_file"), Some(Column::Keyword(_))));
+    }
+
+    /// A dotted mapping name is an object sub-field. The builder only walks
+    /// top-level `_source` keys, so it cannot see `user.bio` inside
+    /// `{"user": {"bio": ..}}`. It must ship no presence column for it (the
+    /// reader then scans source) rather than an empty one that says no row
+    /// has the field.
+    #[test]
+    fn build_doc_value_columns_ships_no_presence_for_a_dotted_text_field() {
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("user.bio".to_string());
+        let docs = [json!({"user": {"bio": "hello"}}), json!({"user": {}})];
+        let cols = super::build_doc_value_columns(docs.iter().map(Some), &skip);
+        assert!(
+            !cols.contains_key("user.bio"),
+            "a dotted field must not get a presence column: {:?}",
+            cols.get("user.bio")
+        );
+    }
+
     async fn assert_flush_freeze_keeps_readers_live_then_finishes(inject_error: bool) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -2793,6 +2847,234 @@ mod flush_publication_recovery_tests {
                  finalize should have been enqueued",
             )
             .expect("flush of an empty memtable must succeed");
+    }
+
+    #[test]
+    fn flush_timeout_override_keeps_the_configured_value_when_the_env_is_junk() {
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, None), 120);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("30")), 30);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("  ")), 120);
+        assert_eq!(super::resolve_flush_timeout_secs("X", 120, Some("0")), 120);
+        assert_eq!(
+            super::resolve_flush_timeout_secs("X", 120, Some("lots")),
+            120
+        );
+        assert_eq!(
+            super::resolve_flush_timeout_secs("X", 120, Some("999999")),
+            120
+        );
+    }
+
+    /// The #1635 admission deadline is wall-clock time. After #2129, a
+    /// paused-clock runtime waiting for a permit held elsewhere auto-advanced
+    /// straight to the 120 s deadline and failed at once. That is how every
+    /// `start_paused` flush test failed at default parallelism whenever
+    /// another test held the process-global finalize gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_does_not_expire_a_flush_admission_wait() {
+        let sema = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let releaser = std::sync::Arc::clone(&sema);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            releaser.add_permits(1);
+        });
+        let started = std::time::Instant::now();
+        let permit = super::wait_for_flush_permit(
+            "paused-admit",
+            "the finalize gate",
+            std::time::Duration::from_secs(120),
+            sema.acquire(),
+        )
+        .await
+        .expect("a permit released after 200ms of real time is inside a 120s budget");
+        assert!(permit.is_some());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "the wait must have lasted until the permit was really released"
+        );
+        holder.join().unwrap();
+    }
+
+    /// The other half: under a paused clock the deadlines still fire, on the
+    /// wall clock, for both the admission wait and a spawned flush task.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_still_enforces_the_wall_clock_flush_deadlines() {
+        let sema = tokio::sync::Semaphore::new(0);
+        let started = std::time::Instant::now();
+        let err = super::wait_for_flush_permit(
+            "paused-admit",
+            "the finalize gate",
+            std::time::Duration::from_millis(100),
+            sema.acquire(),
+        )
+        .await
+        .expect_err("a permit that never comes must still time out");
+        assert!(err.to_string().contains("paused-admit"));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+
+        // A flush task that never finishes. It is pending on the runtime, not
+        // parked on the blocking pool: tokio does not auto-advance a paused
+        // clock while blocking work is in flight, so no timer of any kind
+        // fires then (see `within_wall_clock`).
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        let started = std::time::Instant::now();
+        let err =
+            super::await_flush_task("paused-flush", std::time::Duration::from_millis(100), task)
+                .await
+                .expect_err("a flush task that never finishes must time out");
+        assert!(err.to_string().contains("paused-flush"));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        drop(tx);
+
+        let task = tokio::spawn(async move {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150))
+            })
+            .await
+            .unwrap();
+            Ok(())
+        });
+        super::await_flush_task("paused-flush", std::time::Duration::from_secs(300), task)
+            .await
+            .expect("a flush task that really finishes in 150ms is inside a 300s budget");
+    }
+
+    /// End to end, as CI hit it: a paused-clock index flushes while another
+    /// runtime holds every finalize-gate permit for a moment of real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_flush_waits_for_a_finalize_gate_held_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("paused-gate", Schema::empty()).unwrap();
+        let index = engine.get_index("paused-gate").unwrap();
+        index.abort_background_tasks();
+        index
+            .index_document(Some("p".into()), json!({"body": "paused"}))
+            .await
+            .unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let permits = crate::pools::sizing().flush_finalize as u32;
+                let _held = crate::flush_finalize_gate()
+                    .acquire_many(permits)
+                    .await
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            });
+        });
+        held_rx.recv().unwrap();
+        index
+            .flush()
+            .await
+            .expect("a healthy flush must wait for a gate held for 200ms, not time out");
+        assert_eq!(index.memtable.doc_count(), 0);
+        holder.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_that_never_finishes_fails_that_index_and_the_run_continues() {
+        // #1635 — `finalize-refresh` sat at items=0 with no error because
+        // `flush_finalize_gate().acquire()` (and the per-index flush
+        // semaphore) waited forever, and one stuck index blocked the refresh
+        // of every later index. Hold every finalize-gate permit — a flush
+        // that took one and never returned — and require the waiting index
+        // to fail by name without freezing its memtable, then the next index
+        // to flush normally.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("stuck-docs", Schema::empty()).unwrap();
+        engine
+            .create_index("healthy-docs", Schema::empty())
+            .unwrap();
+        let stuck = engine.get_index("stuck-docs").unwrap();
+        let healthy = engine.get_index("healthy-docs").unwrap();
+        stuck.abort_background_tasks();
+        healthy.abort_background_tasks();
+        stuck
+            .index_document(Some("s".into()), json!({"body": "wedged"}))
+            .await
+            .unwrap();
+        healthy
+            .index_document(Some("h".into()), json!({"body": "fine"}))
+            .await
+            .unwrap();
+        assert_eq!(stuck.memtable.doc_count(), 1);
+        assert_eq!(healthy.memtable.doc_count(), 1);
+
+        stuck.flush_admit_timeout_ms.store(100, Ordering::Relaxed);
+
+        let permits_n = crate::pools::sizing().flush_finalize as u32;
+        let held = crate::flush_finalize_gate()
+            .acquire_many(permits_n)
+            .await
+            .expect("the test must be able to hold the finalize gate");
+        assert_eq!(
+            crate::flush_finalize_gate().available_permits(),
+            0,
+            "the simulated flush must be holding every finalize permit"
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stuck.flush()).await;
+        let elapsed = started.elapsed();
+        let err = outcome
+            .expect("a flush waiting on a permit that never returns must not hang (#1635)")
+            .expect_err("a wedged finalize gate must fail the flush");
+        drop(held);
+
+        let message = err.to_string();
+        assert!(
+            message.contains("stuck-docs"),
+            "the failure must name the stuck index, got: {message}"
+        );
+        assert!(
+            message.contains("finalize gate"),
+            "the failure must name the wait that expired, got: {message}"
+        );
+        assert!(
+            message.contains("not frozen"),
+            "the timeout must be before the memtable freeze, got: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "admission timeout is 100ms; flush took {elapsed:?}"
+        );
+        assert_eq!(
+            stuck.memtable.doc_count(),
+            1,
+            "a timed-out admission must leave the memtable intact"
+        );
+
+        healthy
+            .flush()
+            .await
+            .expect("the next index must still flush after the stuck one failed");
+        assert_eq!(healthy.memtable.doc_count(), 0);
+
+        stuck
+            .flush_admit_timeout_ms
+            .store(30_000, Ordering::Relaxed);
+        stuck.flush_timeout_ms.store(30_000, Ordering::Relaxed);
+        stuck
+            .flush()
+            .await
+            .expect("retry after the wedge clears must succeed; the timeout did not freeze");
+        assert_eq!(stuck.memtable.doc_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9032,6 +9314,16 @@ pub struct Index {
     /// just the handful rayon uses inside a single flush.
     flush_sema: Arc<tokio::sync::Semaphore>,
 
+    /// Milliseconds a shard flush may wait for `flush_sema` or the
+    /// process-global finalize gate before failing. The wait is before the
+    /// memtable freeze (#1635). Production sets this once from
+    /// `engine.flush_admit_timeout_secs`; tests shrink it.
+    flush_admit_timeout_ms: AtomicU64,
+    /// Milliseconds `flush` / `refresh` waits for one index before returning
+    /// an error that names the index. The publish coordinator is detached,
+    /// not aborted (#1015, #1635).
+    flush_timeout_ms: AtomicU64,
+
     /// Set to `true` while a segment merge is in progress.  Prevents the
     /// background merge thread from queueing overlapping merges.
     merge_in_progress: Arc<std::sync::atomic::AtomicBool>,
@@ -9636,6 +9928,7 @@ impl Index {
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
         let segment_hydration_budget = index_segment_hydration_budget(config);
+        let (flush_admit_ms, flush_budget_ms) = configured_flush_timeouts_ms(config);
         let passage_chunk_fields_init = passage_chunk_fields_from_schema(&managed.schema);
         let date_field_scales_snapshot = date_field_scales(&managed.schema);
         // #392: kept back from the struct literal so the SQ8 handle setup at
@@ -9754,6 +10047,8 @@ impl Index {
             flush_sema: Arc::new(tokio::sync::Semaphore::new(
                 config.engine.ingest_shards.max(4),
             )),
+            flush_admit_timeout_ms: AtomicU64::new(flush_admit_ms),
+            flush_timeout_ms: AtomicU64::new(flush_budget_ms),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             compression_config: config.compression.clone(),
@@ -10092,6 +10387,7 @@ impl Index {
             .iter()
             .any(|f| matches!(f.field_type, FieldType::Date));
         let segment_hydration_budget = index_segment_hydration_budget(config);
+        let (flush_admit_ms, flush_budget_ms) = configured_flush_timeouts_ms(config);
         let date_field_scales_snapshot = date_field_scales(&schema.schema);
         let index = Arc::new(Self {
             name,
@@ -10201,6 +10497,8 @@ impl Index {
             flush_sema: Arc::new(tokio::sync::Semaphore::new(
                 config.engine.ingest_shards.max(4),
             )),
+            flush_admit_timeout_ms: AtomicU64::new(flush_admit_ms),
+            flush_timeout_ms: AtomicU64::new(flush_budget_ms),
             merge_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             merge_config: config.merge.clone(),
             compression_config: config.compression.clone(),
@@ -11817,6 +12115,9 @@ impl Index {
         let permit_cell = Arc::new(permit_cell);
         let permit_cell_cb = Arc::clone(&permit_cell);
         let flush_signal_cb = Arc::clone(&self.flush_signal);
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
         rt.spawn(async move {
             let on_drained = move || {
                 if let Ok(mut guard) = permit_cell_cb.lock() {
@@ -11837,6 +12138,8 @@ impl Index {
                 dv_skip,
                 on_drained,
                 warm_caches,
+                index_name,
+                admit_timeout,
                 #[cfg(test)]
                 None,
             )
@@ -12103,8 +12406,22 @@ impl Index {
         };
         // Explicit refresh: wait behind any in-flight concurrent flushes
         // (semaphore has 4 permits) so the user-visible flush sees a
-        // fully-drained memtable once the await returns.
-        let _permit = self.flush_sema.acquire().await.ok();
+        // fully-drained memtable once the await returns. The wait is
+        // bounded (#1635); a permit that never arrives fails this index
+        // instead of parking the caller.
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
+        let flush_timeout =
+            std::time::Duration::from_millis(self.flush_timeout_ms.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + flush_timeout;
+        let _permit = wait_for_flush_permit(
+            &index_name,
+            "the flush semaphore",
+            admit_timeout.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            self.flush_sema.acquire(),
+        )
+        .await?;
         // M5.2 — explicit refresh drains EVERY non-empty shard in
         // sequence (one shard per `do_flush_shard` call) so the
         // user-visible `refresh()` returns with zero unflushed
@@ -12122,7 +12439,14 @@ impl Index {
             if self.memtable.shard_load(shard_idx).0 == 0 {
                 continue;
             }
-            do_flush_shard(
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(flush_budget_timeout_error(&index_name, flush_timeout));
+            }
+            // Spawn so a timeout detaches the shard task instead of
+            // cancelling a publication that has already frozen the
+            // memtable (#1015). The success path still waits for it.
+            let task = tokio::spawn(do_flush_shard(
                 shard_idx,
                 Arc::clone(&self.store),
                 Arc::clone(&self.memtable),
@@ -12134,10 +12458,12 @@ impl Index {
                 dv_skip.clone(),
                 || {}, // serial refresh path — no permit to drop early
                 self.publish_warm_caches(),
+                index_name.clone(),
+                admit_timeout,
                 #[cfg(test)]
                 None,
-            )
-            .await?;
+            ));
+            await_flush_task(&index_name, left, task).await?;
         }
 
         // Update the doc counter so maybe_auto_flush uses a fresh baseline.
@@ -12249,6 +12575,10 @@ impl Index {
 
             let flush_signal_cb = Arc::clone(&self.flush_signal);
             let collection_publication = Arc::clone(&self.collection_publication);
+            let index_name = self.name.as_str().to_string();
+            let admit_timeout = std::time::Duration::from_millis(
+                self.flush_admit_timeout_ms.load(Ordering::Relaxed),
+            );
             tokio::spawn(async move {
                 // Release permit after drain (Phase 1), not after Phase 2
                 // I/O — lets new flushes dispatch while segment writes
@@ -12274,6 +12604,8 @@ impl Index {
                     dv_skip,
                     on_drained,
                     warm_caches,
+                    index_name,
+                    admit_timeout,
                     #[cfg(test)]
                     None,
                 )
@@ -25045,6 +25377,7 @@ impl Index {
                         )));
                     }
                 };
+                let mut segment_hydrated: u64 = 0;
                 for d in arr.iter() {
                     // Skip tombstoned docs.
                     let id_ref = d.get("_id").and_then(Value::as_str).unwrap_or("");
@@ -25069,7 +25402,9 @@ impl Index {
                         }
                     }
                     docs.push(src);
+                    segment_hydrated = segment_hydrated.saturating_add(1);
                 }
+                crate::aggs::note_corpus_hydration(segment_hydrated);
             }
             // Enrich corpus docs with hit-level metadata so score/seq-sensitive
             // sub-aggs reproduce ES semantics: `top_hits` default-sorts by
@@ -25507,9 +25842,17 @@ impl Index {
         let data_dir = self.data_dir.clone();
         let warm_caches = self.publish_warm_caches();
         let index = Arc::clone(self);
+        let index_name = self.name.as_str().to_string();
+        let admit_timeout =
+            std::time::Duration::from_millis(self.flush_admit_timeout_ms.load(Ordering::Relaxed));
+        let flush_timeout =
+            std::time::Duration::from_millis(self.flush_timeout_ms.load(Ordering::Relaxed));
+        let coordinator_name = index_name.clone();
         // This coordinator is the cancellation boundary for the whole flush.
         // If the request future is dropped, its JoinHandle detaches and the
         // coordinator continues owning every shard publication transaction.
+        // The await below uses the same detach on timeout (#1635): the
+        // coordinator is not aborted (#1015).
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
             for shard_idx in 0..n_shards {
@@ -25542,10 +25885,21 @@ impl Index {
                 let excluded_fts_fields = excluded_fts_fields.clone();
                 let dv_skip = dv_skip.clone();
                 let warm_caches = warm_caches.clone();
+                let shard_index_name = coordinator_name.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
                 shard_futures.push(tokio::spawn(async move {
-                    let permit = sema.acquire_owned().await.ok();
+                    let permit = match wait_for_flush_permit(
+                        &shard_index_name,
+                        "the flush semaphore",
+                        admit_timeout,
+                        sema.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error) => return Err(error),
+                    };
                     let permit_cell = Arc::new(std::sync::Mutex::new(permit));
                     let permit_cell_cb = Arc::clone(&permit_cell);
                     let on_drained = move || {
@@ -25565,6 +25919,8 @@ impl Index {
                         dv_skip,
                         on_drained,
                         warm_caches,
+                        shard_index_name,
+                        admit_timeout,
                         #[cfg(test)]
                         test_hook,
                     )
@@ -25608,13 +25964,7 @@ impl Index {
             index.query_cache.clear();
             result
         });
-        let result = match coordinator.await {
-            Ok(result) => result,
-            Err(error) => Err(EngineError::Common(xerj_common::XerjError::internal(
-                format!("flush coordinator failed: {error}"),
-            ))),
-        };
-        result
+        await_flush_task(&index_name, flush_timeout, coordinator).await
     }
 
     /// Check if the memtable exceeds the configured thresholds.
@@ -27047,13 +27397,29 @@ fn build_doc_value_columns<'a>(
     skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
-    use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn};
+    use xerj_storage::doc_values::{Column, KeywordColumn, NumericColumn, PresenceColumn};
 
     // Collect per-field per-doc raw values.  We materialise into vectors
     // so we can decide column-type once we've seen all values.  This is
     // O(docs × fields) memory but much smaller than the segment itself.
     let mut numeric: BTreeMap<String, Vec<Option<i64>>> = BTreeMap::new();
     let mut keyword: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    // `doc_values: false` fields (text, semantic_text) get a presence
+    // bitmap instead of a value column. Pre-seed every skipped name so a
+    // segment where the field is absent still has a column: `exists` then
+    // answers "no row" without parsing source, and a missing column stays
+    // reserved for segments written before this bitmap existed.
+    //
+    // Only top-level names. The loop below sees `_source`'s top-level keys,
+    // so a dotted mapping name (`user.bio`, an object sub-field) never gets a
+    // bit set; seeding it would ship an all-absent bitmap and `exists` would
+    // answer "no row" for documents that have the field. Those fields get
+    // no column and keep the source scan.
+    let mut presence: BTreeMap<String, PresenceColumn> = skip
+        .iter()
+        .filter(|name| !name.contains('.'))
+        .map(|name| (name.clone(), PresenceColumn::empty()))
+        .collect();
     // Fields that carry an ARRAY value in ANY doc of this segment.  The
     // one-slot-per-row column cannot represent a multi-valued doc, and
     // filing it as null makes the column LIE: every consumer (count
@@ -27081,9 +27447,15 @@ fn build_doc_value_columns<'a>(
             if field.starts_with('_') {
                 continue;
             }
-            // Honour the declared mapping. Checked before any allocation so a
-            // skipped field costs nothing per doc.
+            // Honour the declared mapping. A skipped field records presence
+            // only — one bit, not the value — so `exists` does not need the
+            // stored JSON. Checked before any value allocation.
             if skip.contains(field.as_str()) {
+                if value_present(val) {
+                    if let Some(bits) = presence.get_mut(field.as_str()) {
+                        bits.insert(doc_idx as u32);
+                    }
+                }
                 continue;
             }
             // Lookup-first (`get_mut` before `entry`) so the common case
@@ -27185,6 +27557,10 @@ fn build_doc_value_columns<'a>(
                 tracing::warn!("doc-values keyword build failed for one field: {e}");
             }
         }
+    }
+    for (name, mut present) in presence {
+        present.set_doc_count(total_docs as u32);
+        out.insert(name, Column::Presence(present));
     }
     out
 }
@@ -27823,7 +28199,8 @@ impl Index {
                                     n.null_bitmap.is_empty(),
                                 ));
                             }
-                            None => {
+                            // Presence answers `exists`, not term equality.
+                            Some(xerj_storage::doc_values::Column::Presence(_)) | None => {
                                 abandoned = true;
                                 break;
                             }
@@ -28109,7 +28486,8 @@ impl Index {
                             shadow, slo, shi, slo_incl, shi_incl,
                         ));
                     }
-                    None => return None, // abandon — field absent in this segment
+                    // A presence bitmap has no numeric or date values.
+                    Some(xerj_storage::doc_values::Column::Presence(_)) | None => return None,
                 }
             }
 
@@ -28294,19 +28672,22 @@ impl Index {
                             }
                         }
                     }
-                    None => return None, // no dv column → can't count safely
+                    // Presence is not a term dictionary.
+                    Some(Column::Presence(_)) | None => return None,
                 }
             }
             return Some(seg_matches);
         }
 
-        // `exists` — provable only for the DENSE case: a field whose column
-        // has no nulls and covers every doc means every doc has a scalar value
-        // (arrays / objects / json-null leave the null bitmap non-empty), so
-        // all docs match.  Any null / partial coverage / missing column, or a
-        // non-empty memtable, abandons to the scan — which resolves
-        // `get_field_value(...).is_some()` exactly (incl. arrays, dotted
-        // paths).  Meta fields are always present.
+        // `exists` — keyword and numeric columns answer only the DENSE case:
+        // no nulls and full coverage means every doc has a scalar value
+        // (arrays poison the column, so a present column has no hidden
+        // multi-values). A presence bitmap answers any density, because it
+        // records `value_present` per row — the same predicate the source
+        // scan uses — including empty strings and excluding null / `[]` /
+        // `[null]`. A missing column, a column that does not cover the
+        // segment, or a non-empty memtable abandons to the scan. Meta
+        // fields are always present.
         if let QueryNode::Exists { field } = query {
             use xerj_storage::doc_values::Column;
             if self.store.version_map.ghost_events() > 0 || self.memtable.doc_count() > 0 {
@@ -28325,15 +28706,28 @@ impl Index {
                     continue;
                 }
                 let cols = self.dv_columns_for(&segments_dir, &meta.id)?;
-                let (null_empty, dcount) = match cols.get(field.as_str()) {
-                    Some(Column::Keyword(k)) => (k.null_bitmap.is_empty(), k.doc_count as u64),
-                    Some(Column::Numeric(n)) => (n.null_bitmap.is_empty(), n.doc_count as u64),
-                    None => return None, // can't prove presence → scan
+                let add = match cols.get(field.as_str()) {
+                    Some(Column::Keyword(k)) => {
+                        if !k.null_bitmap.is_empty() || k.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        meta.doc_count
+                    }
+                    Some(Column::Numeric(n)) => {
+                        if !n.null_bitmap.is_empty() || n.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        meta.doc_count
+                    }
+                    Some(Column::Presence(p)) => {
+                        if p.doc_count as u64 != meta.doc_count {
+                            return None;
+                        }
+                        p.count()
+                    }
+                    None => return None,
                 };
-                if !null_empty || dcount != meta.doc_count {
-                    return None; // sparse / partial → scan (may still match arrays)
-                }
-                seg_matches = seg_matches.saturating_add(meta.doc_count);
+                seg_matches = seg_matches.saturating_add(add);
             }
             return Some(seg_matches);
         }
@@ -28466,7 +28860,11 @@ impl Index {
                             served_by_dv = true;
                         }
                     }
-                    None => {}
+                    // Presence is not a term dictionary. Leave `served_by_dv`
+                    // false so the caller abandons to the source scan (#362):
+                    // a `term` on text must agree with `_search`, which
+                    // compares the whole source value, not a bit.
+                    Some(xerj_storage::doc_values::Column::Presence(_)) | None => {}
                 }
             }
 
@@ -30010,6 +30408,17 @@ impl Index {
                         });
                     }
                     ScoredFilterLeaf::SourceExists { field } => {
+                        // A presence bitmap answers `exists` without parsing
+                        // stored JSON. Segments written before the bitmap
+                        // existed still fall through to the source slices.
+                        if let Some(xerj_storage::doc_values::Column::Presence(p)) =
+                            cols.get(field.as_str())
+                        {
+                            if p.doc_count == meta.doc_count as u32 {
+                                fev.push(FilterEval::Presence { col: p });
+                                continue;
+                            }
+                        }
                         // Cache-backed stored slices for this segment; the
                         // `?` bails the whole columnar path (brute answers).
                         let slices = self.stored_slices_for(meta.id.as_str(), meta.doc_count)?;
@@ -30644,6 +31053,15 @@ impl Index {
         Some((hits, total, from_applied))
     }
 
+    /// Stored sections this index currently holds decoded: the decompressed
+    /// byte cache, the per-doc slice cache, and the parsed-document cache.
+    /// A presence-backed `exists` leaves all three untouched.
+    pub fn stored_sections_cached(&self) -> usize {
+        self.decoded_stored_cache.len()
+            + self.stored_slices_cache.len()
+            + self.stored_value_cache.len()
+    }
+
     /// Cache-backed reader for a segment's parsed stored section.
     ///
     /// First call for a segment opens the segment, decodes the Stored
@@ -30999,7 +31417,7 @@ impl Index {
                 }
                 shadow_range_positions(shadow, slo, shi, slo_incl, shi_incl)
             }
-            None => return None,
+            Some(Column::Presence(_)) | None => return None,
         };
         let built: Arc<PrefilterSet> = Arc::new(PrefilterSet::from_vec(matching));
         if self.range_prefilter_cache.len() >= 32 {
@@ -31095,6 +31513,8 @@ impl Index {
                 }
                 Some(Arc::new(PrefilterSet::from_set(set)))
             }
+            // No ordinals to enumerate. A full scan stays correct.
+            Column::Presence(_) => None,
         }
     }
 
@@ -31741,6 +32161,7 @@ impl Index {
                     },
                 )
             }
+            Column::Presence(_) => None,
         }
     }
 
@@ -33321,6 +33742,159 @@ mod captured_entry_verdict_table {
     }
 }
 
+/// Resolve the two flush deadlines for one index.
+///
+/// Environment overrides win over the config file, matching `XERJ_FIN_CONC`.
+/// A value that is not a whole number of seconds in `1..=86_400` is ignored
+/// and reported; an override that would make the caller give up before
+/// admission can finish is raised to the admission bound.
+fn configured_flush_timeouts_ms(config: &Config) -> (u64, u64) {
+    let admit = resolve_flush_timeout_secs(
+        "XERJ_FLUSH_ADMIT_TIMEOUT_SECS",
+        config.engine.flush_admit_timeout_secs,
+        std::env::var("XERJ_FLUSH_ADMIT_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    );
+    let mut overall = resolve_flush_timeout_secs(
+        "XERJ_FLUSH_TIMEOUT_SECS",
+        config.engine.flush_timeout_secs,
+        std::env::var("XERJ_FLUSH_TIMEOUT_SECS").ok().as_deref(),
+    );
+    if overall < admit {
+        warn!(
+            admit_secs = admit,
+            flush_secs = overall,
+            "flush timeout is shorter than the admission timeout; raising it so a flush \
+             can finish waiting for a permit"
+        );
+        overall = admit;
+    }
+    (admit.saturating_mul(1000), overall.saturating_mul(1000))
+}
+
+/// `configured` is the validated config value. `env_value` is the raw
+/// override, already read by the caller so tests can pass it without
+/// touching the process environment.
+fn resolve_flush_timeout_secs(name: &str, configured: u64, env_value: Option<&str>) -> u64 {
+    let Some(raw) = env_value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return configured;
+    };
+    let max = xerj_common::config::EngineConfig::MAX_FLUSH_TIMEOUT_SECS;
+    match raw.parse::<u64>() {
+        Ok(secs) if (1..=max).contains(&secs) => secs,
+        _ => {
+            warn!(
+                "{name}={raw} is not a whole number of seconds from 1 to {max}; using {configured}s"
+            );
+            configured
+        }
+    }
+}
+
+fn flush_admit_timeout_error(index: &str, what: &str, budget: std::time::Duration) -> EngineError {
+    warn!(
+        index,
+        wait = what,
+        budget_ms = budget.as_millis() as u64,
+        "flush timed out waiting for admission; the memtable was not frozen"
+    );
+    EngineError::Common(xerj_common::XerjError::internal(format!(
+        "index [{index}] flush timed out after {budget:?} waiting for {what}; \
+         the memtable was not frozen, so this flush can be retried"
+    )))
+}
+
+fn flush_budget_timeout_error(index: &str, budget: std::time::Duration) -> EngineError {
+    warn!(
+        index,
+        budget_ms = budget.as_millis() as u64,
+        "flush timed out; the publish coordinator was left running"
+    );
+    EngineError::Common(xerj_common::XerjError::internal(format!(
+        "index [{index}] flush timed out after {budget:?}; the publish coordinator was left \
+         running so a publication already past the freeze can finish, and this refresh can be \
+         retried"
+    )))
+}
+
+/// Wait for a flush-admission permit.
+///
+/// A closed semaphore still yields `Ok(None)`, which is what the old
+/// `.ok()` did. A timeout is an error and does not hold a permit: the
+/// acquire future is dropped, so the wait is cancelled before the freeze.
+async fn wait_for_flush_permit<T>(
+    index: &str,
+    what: &str,
+    budget: std::time::Duration,
+    acquire: impl std::future::Future<Output = std::result::Result<T, tokio::sync::AcquireError>>,
+) -> Result<Option<T>> {
+    match within_wall_clock(budget, acquire).await {
+        Some(Ok(permit)) => Ok(Some(permit)),
+        Some(Err(_)) => Ok(None),
+        None => Err(flush_admit_timeout_error(index, what, budget)),
+    }
+}
+
+/// Await `fut` for at most `budget` of wall-clock time.
+///
+/// The flush deadlines (#1635) are operator budgets in real seconds, so they
+/// are measured with [`std::time::Instant`], not tokio's clock. The two differ
+/// when the clock is paused (`#[tokio::test(start_paused = true)]`): a paused
+/// runtime that goes idle auto-advances to its next timer. A flush waiting on
+/// the process-global finalize gate, whose permit another runtime holds, is
+/// idle on its own runtime, so a plain `tokio::time::timeout(120s)` fired at
+/// once and failed a healthy flush with "timed out after 120s". A tokio timer
+/// never fires before the wall-clock deadline on a running clock, so the
+/// early-fire branch below is only taken when the clock is paused. It waits a
+/// real slice on the blocking pool (no timer, so no auto-advance) and tries
+/// again. `None` means the wall-clock budget ran out; the future is dropped.
+/// While blocking-pool work is in flight a paused clock does not advance at
+/// all, so the deadline is only checked once that work (or the future)
+/// makes progress; a running clock has no such gap.
+async fn within_wall_clock<F: std::future::Future>(
+    budget: std::time::Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let deadline = std::time::Instant::now() + budget;
+    tokio::pin!(fut);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Ok(output) = tokio::time::timeout(left, &mut fut).await {
+            return Some(output);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let nap = left.min(std::time::Duration::from_millis(5));
+        tokio::select! {
+            biased;
+            output = &mut fut => return Some(output),
+            _ = tokio::task::spawn_blocking(move || std::thread::sleep(nap)) => {}
+        }
+    }
+}
+
+/// Bound one spawned flush task.
+///
+/// Dropping the [`JoinHandle`] on timeout detaches the task. It does not
+/// abort it, so a publication that has already frozen the memtable keeps
+/// its non-cancellable worker (#1015).
+async fn await_flush_task(
+    index: &str,
+    budget: std::time::Duration,
+    task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    match within_wall_clock(budget, task).await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(EngineError::Common(xerj_common::XerjError::internal(
+            format!("index [{index}] flush task failed: {error}"),
+        ))),
+        None => Err(flush_budget_timeout_error(index, budget)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_flush_shard(
     shard_idx: usize,
@@ -33340,6 +33914,8 @@ async fn do_flush_shard(
     // read-path caches, threaded through because this is a free fn without
     // access to `Index`.
     warm_caches: PublishWarmCaches,
+    index_name: String,
+    admit_timeout: std::time::Duration,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
     // #1226 — re-check emptiness BEFORE the process-global finalize gate.
@@ -33365,7 +33941,24 @@ async fn do_flush_shard(
     let fin_permit = if bypass_finalize_gate {
         None
     } else {
-        crate::flush_finalize_gate().acquire().await.ok()
+        // #1635 — this acquire used to wait forever. A finalize that holds
+        // the process-global permit and never returns parked every later
+        // `_refresh` with no error. Timing out here is before the freeze,
+        // so the memtable is unchanged and the caller can retry.
+        match wait_for_flush_permit(
+            &index_name,
+            "the finalize gate",
+            admit_timeout,
+            crate::flush_finalize_gate().acquire(),
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                on_drained();
+                return Err(error);
+            }
+        }
     };
     // #1015 — NO collection-publication guard here.  The drain below is a
     // FREEZE, not a removal: the claimed docs stay reader-visible in the
@@ -49384,6 +49977,7 @@ fn seg_term_positions(
             }
             Some(set)
         }
+        Column::Presence(_) => None,
     }
 }
 
@@ -49549,7 +50143,7 @@ fn build_sort_shadow(
             });
             Some(Arc::new(sorted))
         }
-        None => None,
+        Some(Column::Presence(_)) | None => None,
     }
 }
 
@@ -52915,9 +53509,16 @@ enum FilterEval<'a> {
     /// presence from the segment's cached stored slices, using the SAME
     /// `get_field_value` + `value_present` predicate as the brute scan.
     /// Owned `Resident` so the eval outlives the segment iteration.
+    /// Reached only when the segment has no presence bitmap.
     Source {
         field: String,
         slices: Resident<StoredSlices>,
+    },
+    /// `exists` answered from the segment's presence bitmap. No stored
+    /// bytes are decoded. `col.doc_count` was checked against the segment
+    /// length before this leaf was built.
+    Presence {
+        col: &'a xerj_storage::doc_values::PresenceColumn,
     },
 }
 impl FilterEval<'_> {
@@ -52966,6 +53567,7 @@ impl FilterEval<'_> {
                 let source = doc.get("_source").unwrap_or(&doc);
                 get_field_value(source, field).is_some_and(|v| value_present(&v))
             }
+            FilterEval::Presence { col } => col.contains(row),
         }
     }
 
@@ -53015,6 +53617,10 @@ impl FilterEval<'_> {
             FilterEval::Source { .. } => {
                 unreachable!("source-backed exists has no closed-form count")
             }
+            // Bitmap cardinality. Ghosts are excluded by the caller that
+            // walks rows; `constant_plan` still refuses SourceExists, so
+            // this arm is the exhaustive match, not the closed-form lane.
+            FilterEval::Presence { col } => col.count(),
         }
     }
 }
@@ -53230,21 +53836,14 @@ enum ScoredFilterLeaf {
         min_inc: bool,
         max_inc: bool,
     },
-    /// `exists` on a field with NO doc-values column (text /
-    /// semantic_text): per-row presence is only observable in the stored
-    /// source.  Evaluated from the segment's cached stored slices — the
-    /// SAME `get_field_value` + `value_present` predicate the brute scan
-    /// applies, so the hit set cannot drift — but only reached on rows
-    /// that already passed every cheaper conjunct in the same loop (each
-    /// row walk short-circuits in fev order), which is what turns
-    /// `bool.filter: [term, exists]` from a whole-index source scan into
-    /// a term-column walk plus a handful of source parses.  #1183's
-    /// finalize-verify query (`term: ax_file` + `exists: <semantic
-    /// field>`) measured took=9638ms / 0 hits on a 91k-doc segment
-    /// because `exists` in a bool forced the brute path; this leaf makes
-    /// it columnar.  Keyword/numeric `exists` does NOT come here — those
-    /// lower to the empty-prefix dictionary range / unbounded window
-    /// above and never touch the source.
+    /// `exists` on a field with no value column (text / semantic_text,
+    /// `doc_values: false`). A segment that carries a presence bitmap
+    /// answers from that bitmap. Older segments fall back to the cached
+    /// stored slices and the SAME `get_field_value` + `value_present`
+    /// predicate the brute scan applies. The leaf is only reached on rows
+    /// that already passed every cheaper conjunct in the same loop.
+    /// Keyword/numeric `exists` does NOT come here — those lower to the
+    /// empty-prefix dictionary range / unbounded window above.
     SourceExists { field: String },
 }
 
@@ -59141,6 +59740,8 @@ mod flush_memory_integration_tests {
             dv_skip,
             || {},
             warm_caches,
+            idx.name.as_str().to_string(),
+            std::time::Duration::from_secs(30),
             Some(hook),
         )
         .await;
@@ -60950,6 +61551,8 @@ mod exact_scan_hydration_tests {
                 std::collections::HashSet::new(),
                 move || drained_flag.store(true, std::sync::atomic::Ordering::SeqCst),
                 idx.publish_warm_caches(),
+                idx.name.as_str().to_string(),
+                std::time::Duration::from_secs(30),
                 None,
             ),
         )
