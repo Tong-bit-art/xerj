@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `_reindex` honours `dest.op_type: create`, `conflicts`, and `max_docs`
+  instead of silently dropping them. `create` no longer overwrites an
+  existing destination document: the default abort returns 409 with ES's
+  version-conflict failure, and `conflicts: proceed` skips and counts it.
+  `max_docs` caps successful writes (the query-parameter form is accepted
+  too); invalid values are refused before any source or destination work.
+
 - Boolean text queries with one `must` match now keep `filter` and `must_not`
   clauses non-scoring before a flush and on mixed memory/segment indices.
   Their retained hits use the same BM25 scores as the bare match (#2403).

@@ -28255,6 +28255,22 @@ pub async fn clear_scroll_path(
 pub struct ReindexBody {
     pub source: ReindexSource,
     pub dest: ReindexDest,
+    /// `conflicts`: `abort` (default) stops on the first version conflict;
+    /// `proceed` skips it, counts it, and keeps copying.
+    #[serde(default)]
+    pub conflicts: Option<String>,
+    /// `max_docs`: cap on documents successfully written. `-1` or absent
+    /// means no cap. The handler validates the positive/-1 range before any
+    /// source or destination work.
+    #[serde(default)]
+    pub max_docs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReindexParams {
+    /// `_reindex?max_docs=N` — the query-parameter form ES also accepts.
+    #[serde(default)]
+    pub max_docs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28287,6 +28303,12 @@ pub struct ReindexDest {
     /// `{"created": N}` having copied every document VERBATIM.
     #[serde(default)]
     pub pipeline: Option<String>,
+    /// `dest.op_type`: `index` (default) overwrites an existing id; `create`
+    /// only creates missing documents and reports a version conflict for an
+    /// existing id. Serde used to drop this field, so `create` silently
+    /// overwrote the destination and answered 200.
+    #[serde(default)]
+    pub op_type: Option<String>,
 }
 
 /// The filter attached to `alias` on one backing index, if any. Alias
@@ -28305,8 +28327,41 @@ fn alias_filter_for(state: &AppState, backing: &str, alias: &str) -> Option<Valu
         })
 }
 
+/// The ES `_reindex` summary shared by the success and version-conflict-abort
+/// responses. `total` counts documents successfully processed, not the number
+/// of source hits returned: a conflict is counted separately in
+/// `version_conflicts`, and an abort carries it in `failures` as a 409 bulk
+/// item while the HTTP status is also 409.
+#[allow(clippy::too_many_arguments)]
+fn reindex_summary(
+    started: Instant,
+    total: usize,
+    updated: usize,
+    created: usize,
+    noops: usize,
+    batches: usize,
+    version_conflicts: usize,
+    failures: &[Value],
+) -> Value {
+    json!({
+        "took": started.elapsed().as_millis() as u64,
+        "timed_out": false,
+        "total": total,
+        "updated": updated,
+        "created": created,
+        "deleted": 0,
+        "batches": batches,
+        "failures": failures,
+        "throttled_millis": 0,
+        "noops": noops,
+        "version_conflicts": version_conflicts,
+        "retries": { "bulk": 0, "search": 0 },
+    })
+}
+
 pub async fn reindex(
     State(state): State<AppState>,
+    Query(params): Query<ReindexParams>,
     Json(body): Json<ReindexBody>,
 ) -> impl IntoResponse {
     let started = Instant::now();
@@ -28346,6 +28401,53 @@ pub async fn reindex(
         )
             .into_response();
     }
+
+    // Validate request controls before any source is flushed or the
+    // destination is created. Serde used to drop all three, so a caller
+    // asking for create-only or a capped copy silently got an overwriting
+    // full copy (and a 200).
+    let op_type = body.dest.op_type.as_deref().unwrap_or("index");
+    if !matches!(op_type, "index" | "create") {
+        return es_bad_request(
+            "illegal_argument_exception",
+            &format!("op_type [{op_type}] is not valid; must be one of [index, create]"),
+            None,
+        );
+    }
+    let conflicts = body.conflicts.as_deref().unwrap_or("abort");
+    if !matches!(conflicts, "abort" | "proceed") {
+        return es_bad_request(
+            "illegal_argument_exception",
+            &format!("conflicts [{conflicts}] is not valid; must be one of [abort, proceed]"),
+            None,
+        );
+    }
+    let max_docs = match body.max_docs.or(params.max_docs) {
+        None | Some(-1) => None,
+        Some(n) if n > 0 => match usize::try_from(n) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "maxDocs should be greater than 0 if the request is limited to some \
+                         number of documents or -1 if it isn't but it was [{n}]"
+                    ),
+                    None,
+                )
+            }
+        },
+        Some(n) => {
+            return es_bad_request(
+                "illegal_argument_exception",
+                &format!(
+                    "maxDocs should be greater than 0 if the request is limited to some \
+                     number of documents or -1 if it isn't but it was [{n}]"
+                ),
+                None,
+            )
+        }
+    };
 
     let source_name = &body.source.index;
     // The destination may be an alias. ES routes a write through an alias to
@@ -28489,13 +28591,31 @@ pub async fn reindex(
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut noops = 0usize;
+    let mut version_conflicts = 0usize;
     let mut failures: Vec<Value> = Vec::new();
     let mut batches = 0usize;
+    // Set when `max_docs` has been reached mid-page, so both the hit loop and
+    // the member/page loops stop without counting the rest of that page.
+    let mut stop = false;
 
     for (_, source_idx, mut search_req) in prepared_sources {
         // IDs are ordered only within one source member. Each parsed plan
         // starts with no cursor and advances after its own completed page.
         loop {
+            if let Some(limit) = max_docs {
+                if created + updated >= limit {
+                    stop = true;
+                    break;
+                }
+            }
+            // `max_docs` caps SUCCESSFUL writes. With `conflicts=proceed` a
+            // page may contain conflicts, so request only the writes still
+            // allowed and keep paging when conflicts consume the page.
+            search_req.size = match max_docs {
+                Some(limit) => limit.saturating_sub(created + updated).min(page_size),
+                None => page_size,
+            };
+            let requested = search_req.size;
             let results = match source_idx.search(&search_req).await {
                 Ok(r) => r,
                 Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
@@ -28514,12 +28634,12 @@ pub async fn reindex(
             }
 
             batches += 1;
-            total_fetched += batch_size;
 
             // Capture the keyset cursor before the `for` loop consumes `results.hits`.
             let last_id = results.hits.last().map(|h| h.id.clone());
 
             for hit in results.hits {
+                total_fetched += 1;
                 if !hit.source.is_null() {
                     // `dest.pipeline`, if the request named one. Already known to
                     // exist and to be runnable (checked before any copy started),
@@ -28565,30 +28685,88 @@ pub async fn reindex(
                             }
                         },
                     };
-                    // Check if doc already exists in dest to track created vs updated.
-                    let exists = dest_idx
-                        .get_document(&hit.id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    match dest_idx
-                        .index_document(Some(hit.id.clone()), doc_source)
-                        .await
-                    {
-                        Ok(_) => {
-                            if exists {
-                                updated += 1;
-                            } else {
-                                created += 1;
+                    if op_type == "create" {
+                        // `create_document` is the engine's atomic
+                        // op_type=create: the existence check runs under the
+                        // write lock, so a concurrent writer cannot slip a
+                        // document between a get_document() and the write.
+                        match dest_idx.create_document(hit.id.clone(), doc_source).await {
+                            Ok(_) => created += 1,
+                            Err(xerj_engine::EngineError::Common(
+                                xerj_common::XerjError::VersionConflict { id, actual, .. },
+                            )) => {
+                                version_conflicts += 1;
+                                if conflicts == "proceed" {
+                                    continue;
+                                }
+                                // ES aborts the run on the first conflict and
+                                // answers 409 with one bulk failure entry; the
+                                // document already in the destination is not
+                                // overwritten.
+                                failures.push(json!({
+                                    "index": dest_name.as_str(),
+                                    "id": hit.id,
+                                    "status": 409,
+                                    "cause": {
+                                        "type": "version_conflict_engine_exception",
+                                        "reason": format!(
+                                            "[{id}]: version conflict, document already exists \
+                                             (current version [{actual}])"
+                                        ),
+                                        "index": dest_name.as_str(),
+                                        "shard": "0",
+                                    },
+                                }));
+                                return (
+                                    StatusCode::CONFLICT,
+                                    Json(reindex_summary(
+                                        started,
+                                        created + updated + noops,
+                                        updated,
+                                        created,
+                                        noops,
+                                        batches,
+                                        version_conflicts,
+                                        &failures,
+                                    )),
+                                )
+                                    .into_response();
                             }
-                        }
-                        Err(e) => {
-                            failures.push(json!({
+                            Err(e) => failures.push(json!({
                                 "id": hit.id,
                                 "cause": { "type": "reindex_error", "reason": e.to_string() },
-                            }));
+                            })),
                         }
+                    } else {
+                        // Check if doc already exists in dest to track created vs updated.
+                        let exists = dest_idx
+                            .get_document(&hit.id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        match dest_idx
+                            .index_document(Some(hit.id.clone()), doc_source)
+                            .await
+                        {
+                            Ok(_) => {
+                                if exists {
+                                    updated += 1;
+                                } else {
+                                    created += 1;
+                                }
+                            }
+                            Err(e) => {
+                                failures.push(json!({
+                                    "id": hit.id,
+                                    "cause": { "type": "reindex_error", "reason": e.to_string() },
+                                }));
+                            }
+                        }
+                    }
+                    if max_docs.is_some_and(|limit| created + updated >= limit) {
+                        stop = true;
+                        break;
                     }
                 }
             }
@@ -28596,33 +28774,30 @@ pub async fn reindex(
             // Advance the keyset cursor to the last `_id` of this page.
             search_req.search_after = last_id.map(|id| vec![json!(id)]);
 
-            // Stop if we've reached the safety backstop or fetched fewer docs than
-            // requested (meaning we hit the end of the source).
-            if batch_size < page_size || total_fetched >= max_total {
+            // Stop if the write cap was reached, the safety backstop fired, or
+            // this page was short (the member is exhausted). `requested` is
+            // the size actually sent, which may be below `page_size` because
+            // of `max_docs`.
+            if stop || batch_size < requested || total_fetched >= max_total {
                 break;
             }
         }
 
-        if total_fetched >= max_total {
+        if stop || total_fetched >= max_total {
             break;
         }
     }
 
-    let took = started.elapsed().as_millis() as u64;
-    Json(json!({
-        "took": took,
-        "timed_out": false,
-        "total": total_fetched,
-        "updated": updated,
-        "created": created,
-        "deleted": 0,
-        "batches": batches,
-        "failures": failures,
-        "throttled_millis": 0,
-        "noops": noops,
-        "version_conflicts": 0,
-        "retries": { "bulk": 0, "search": 0 },
-    }))
+    Json(reindex_summary(
+        started,
+        created + updated + noops,
+        updated,
+        created,
+        noops,
+        batches,
+        version_conflicts,
+        &failures,
+    ))
     .into_response()
 }
 
@@ -49783,11 +49958,18 @@ mod reindex_keyset_tests {
             dest: ReindexDest {
                 index: "dst".into(),
                 pipeline: None,
+                op_type: None,
             },
+            conflicts: None,
+            max_docs: None,
         };
-        let resp = reindex(State(state.clone()), Json(body))
-            .await
-            .into_response();
+        let resp = reindex(
+            State(state.clone()),
+            Query(ReindexParams::default()),
+            Json(body),
+        )
+        .await
+        .into_response();
         assert!(
             resp.status().is_success(),
             "reindex returned {}",
